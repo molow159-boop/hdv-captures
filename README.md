@@ -1,6 +1,38 @@
-# HDV Captures
+<p align="center"><img src="assets/icon.png" alt="Icône HDV Captures" width="72"></p>
+<h1 align="center">HDV Captures</h1>
+<p align="center"><strong>Capturez vos fiches HDV, vérifiez-les et préparez vos lots en quelques clics.</strong></p>
+<p align="center">
+  <a href="https://github.com/molow159-boop/hdv-captures/releases/latest"><img src="https://img.shields.io/github/v/release/molow159-boop/hdv-captures?label=Version&amp;color=00b8c4" alt="Dernière version"></a>
+  <img src="https://img.shields.io/badge/Windows-x64-0078D4" alt="Windows x64">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/Licence-MIT-00b8c4" alt="Licence MIT"></a>
+</p>
+<p align="center">
+  <a href="https://github.com/molow159-boop/hdv-captures/releases/latest"><strong>Télécharger pour Windows</strong></a> ·
+  <a href="#utiliser">Tuto d’utilisation</a> ·
+  <a href="#compiler-sous-windows">Tuto de compilation</a> ·
+  <a href="https://github.com/molow159-boop/hdv-captures/issues">Signaler un problème</a>
+</p>
 
-Application Windows en Rust pour enregistrer les fiches HDV affichées à l'écran, les vérifier et préparer leur import manuel. Version **1.0**.
+**HDV Captures 1.0** est une application Windows en Rust pour enregistrer les fiches HDV affichées à l'écran et préparer leur import manuel. Le ZIP Windows inclut le moteur OCR : aucune installation séparée de Tesseract n'est nécessaire.
+
+![Interface de collecte HDV Captures](assets/screenshots/collecte.png)
+
+## L’essentiel
+
+| Fonction | Utilisation |
+| --- | --- |
+| Capture automatique | Enregistrez les nouvelles fiches pendant que vous les parcourez. |
+| Capture manuelle | Utilisez le bouton ou un raccourci configurable. |
+| Galerie et suivi | Vérifiez les PNG et retrouvez les fiches à reprendre. |
+| Préparation de l’envoi | Déplacez les captures dans un nouveau lot, sans reprendre les lots précédents. |
+| Sous-dossiers numérotés | Définissez le maximum de captures par dossier. |
+| Fenêtre adaptable | Gardez les commandes au premier plan, en mode compact ou près de l’horloge. |
+
+## En images
+
+[![Galerie et préparation de l’envoi](assets/screenshots/captures.png)](assets/screenshots/captures.png)
+
+*La galerie regroupe la recherche, l’actualisation, l’aperçu et la préparation de l’envoi. Les vues ci-dessus montrent une session vierge, sans données personnelles.*
 
 ## Utiliser
 
@@ -45,11 +77,19 @@ Pour **recompiler aussi Tesseract**, ajoute le composant **Outils C++ CMake pour
 
 **Place occupée après compilation :** Rust crée automatiquement un dossier `target`, qui peut prendre plusieurs Go avec les dépendances, les tests et les caches. Ce dossier n'est pas fourni dans les sources et n'est pas nécessaire pour utiliser le logiciel. Après avoir copié l'EXE et ses fichiers nécessaires ailleurs, tu peux supprimer `target` ; Rust le recréera à la prochaine compilation.
 
+<details>
+<summary><strong>Détails du moteur OCR intégré</strong></summary>
+
 ## OCR intégré
 
 Le moteur fourni est **Tesseract 5.5.3**, avec Leptonica 1.87.0, libpng 1.6.58, libtiff 4.7.2, libjpeg-turbo 3.1.3 et zlib 1.3.2. Sa compilation inclut les fonctions utilisées par l'application : lecture des PNG et résultats texte/TSV. Les modèles `tessdata_fast` français et anglais conservent le réglage `fra+eng` de la reconnaissance.
 
 Le moteur intégré utilise ses propres langues. Une mise à jour de Tesseract installé ailleurs sur le PC ne le remplace pas. Dans **Paramètres**, un chemin personnalisé reste prioritaire ; **Détection automatique** revient au moteur fourni. Les licences et les références des sources accompagnent le dossier `ocr`.
+
+</details>
+
+<details>
+<summary><strong>Données locales et sécurité</strong></summary>
 
 ## Données et sécurité
 
@@ -60,3 +100,5 @@ L'application lit les pixels de l'écran et utilise un OCR local. Elle n'envoie 
 Ce dépôt contient uniquement les sources, l'icône, les fichiers de compilation, la licence, cette documentation et la vérification Windows. Il ne contient ni historique, ni captures de jeu personnelles, ni configuration utilisateur. Les tests publics utilisent des données synthétiques. Voir [SECURITY.md](SECURITY.md) pour les signalements et la protection des données.
 
 Projet indépendant, sans affiliation à Ankama. Licence [MIT](LICENSE) pour le code du projet ; les dépendances conservent leurs licences, reproduites dans [LICENCES-TIERS.txt](LICENCES-TIERS.txt) et dans le dossier `ocr/licences` du ZIP Windows.
+
+</details>
