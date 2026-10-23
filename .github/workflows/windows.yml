@@ -1,0 +1,30 @@
+name: Windows
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer Rust stable et les outils de verification
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Verifier et compiler
+        shell: pwsh
+        run: |
+          ./Compiler-Windows.ps1
+          ./Compiler-OCR.ps1
+          Copy-Item README.md, LICENSE, LICENCES-TIERS.txt, SECURITY.md target/release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HDV-Captures-Windows-x64
+          path: |
+            target/release/hdv-captures.exe
+            target/release/ocr/
+            target/release/README.md
+            target/release/LICENSE
+            target/release/LICENCES-TIERS.txt
+            target/release/SECURITY.md
+          if-no-files-found: error

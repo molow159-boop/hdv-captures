@@ -1,0 +1,29 @@
+[package]
+name = "hdv-captures"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+description = "Capture locale des fiches HDV de Dofus 3 pour import manuel"
+
+[dependencies]
+eframe = "0.31"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+screenshots = "0.8.10"
+global-hotkey = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rfd = "0.15"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[build-dependencies]
+winres = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+raw-window-handle = "0.6"
+windows-sys = { version = "0.52", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_Graphics_Gdi"] }
