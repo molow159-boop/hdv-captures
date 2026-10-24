@@ -6,7 +6,7 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Installer Rust stable et les outils de verification
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
