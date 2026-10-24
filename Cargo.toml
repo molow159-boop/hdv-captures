@@ -9,7 +9,7 @@ description = "Capture locale des fiches HDV de Dofus 3 pour import manuel"
 eframe = "0.31"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 screenshots = "0.8.10"
-global-hotkey = "0.7"
+global-hotkey = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
