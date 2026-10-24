@@ -1,12 +1,15 @@
 //! Reconnaissance VISUELLE des noms. Aucun accès au processus Dofus.
 //! En mode automatique, une fiche sans OCR lisible n'est pas envoyée.
+use crate::error::AppError;
 use crate::settings::CaptureRect;
 use image::{imageops, RgbaImage};
 use std::{
     collections::BTreeMap,
+    io::Read,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Output, Stdio},
     sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
 
 static OCR_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -73,12 +76,71 @@ fn command(exe: &Path) -> Command {
     cmd
 }
 
+fn output_bounded(mut command: Command, timeout: Duration) -> Result<Output, AppError> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000);
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(AppError::from)?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or(AppError::Domain(crate::error::DomainError::OcrStdout))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or(AppError::Domain(crate::error::DomainError::OcrStderr))?;
+    // Drain both pipes while polling, otherwise a full pipe could deadlock the child.
+    let out = std::thread::spawn(move || {
+        let mut data = Vec::new();
+        stdout.read_to_end(&mut data).map(|_| data)
+    });
+    let err = std::thread::spawn(move || {
+        let mut data = Vec::new();
+        stderr.read_to_end(&mut data).map(|_| data)
+    });
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(15)),
+            other => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(match other {
+                    Err(error) => AppError::from(error),
+                    _ => AppError::OcrTimeout(timeout),
+                });
+            }
+        }
+    };
+    let stdout = out
+        .join()
+        .map_err(|_| AppError::OcrReadInterrupted)?
+        .map_err(AppError::from)?;
+    let stderr = err
+        .join()
+        .map_err(|_| AppError::OcrReadInterrupted)?
+        .map_err(AppError::from)?;
+    Ok(Output {
+        status: status?,
+        stdout,
+        stderr,
+    })
+}
+
 pub fn locate(configured: Option<&Path>) -> Option<PathBuf> {
     let executable = std::env::current_exe().ok();
     let app_dir = executable.as_deref().and_then(Path::parent);
     let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
     for path in candidates(configured, app_dir, program_files.as_deref()) {
-        if let Ok(result) = command(&path).arg("--version").output() {
+        if let Ok(result) = {
+            let mut cmd = command(&path);
+            cmd.arg("--version");
+            output_bounded(cmd, Duration::from_secs(3))
+        } {
             if result.status.success() {
                 return Some(path);
             }
@@ -87,12 +149,12 @@ pub fn locate(configured: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-pub fn check_languages(exe: &Path) -> Result<(), String> {
+pub fn check_languages(exe: &Path) -> Result<(), AppError> {
     let mut cmd = command(exe);
     cmd.arg("--list-langs");
-    let out = cmd.output().map_err(|e| e.to_string())?;
+    let out = output_bounded(cmd, Duration::from_secs(3))?;
     if !out.status.success() {
-        return Err("Tesseract indisponible".into());
+        return Err(AppError::Domain(crate::error::DomainError::OcrUnavailable));
     }
     let all = format!(
         "{}\n{}",
@@ -101,14 +163,14 @@ pub fn check_languages(exe: &Path) -> Result<(), String> {
     );
     for lang in ["fra", "eng"] {
         if !all.lines().any(|s| s.trim() == lang) {
-            return Err(format!("Langue {lang} manquante"));
+            return Err(AppError::OcrLanguage(lang));
         }
     }
     Ok(())
 }
-fn recognize(image: &RgbaImage, exe: &Path, psm: u8, output: &str) -> Result<String, String> {
+fn recognize(image: &RgbaImage, exe: &Path, psm: u8, output: &str) -> Result<String, AppError> {
     if image.width() < 10 || image.height() < 10 {
-        return Err("Zone OCR trop petite".into());
+        return Err(AppError::Domain(crate::error::DomainError::OcrAreaTooSmall));
     }
     let tmp = std::env::temp_dir().join(format!(
         "hdv-ocr-{}-{}.png",
@@ -117,7 +179,7 @@ fn recognize(image: &RgbaImage, exe: &Path, psm: u8, output: &str) -> Result<Str
     ));
     image
         .save_with_format(&tmp, image::ImageFormat::Png)
-        .map_err(|e| format!("Préparation OCR : {e}"))?;
+        .map_err(|e| AppError::context("Préparation OCR", e))?;
     let mut cmd = command(exe);
     cmd.arg(&tmp)
         .arg("stdout")
@@ -126,17 +188,17 @@ fn recognize(image: &RgbaImage, exe: &Path, psm: u8, output: &str) -> Result<Str
         .arg("--psm")
         .arg(psm.to_string())
         .arg(output);
-    let result = cmd.output();
+    let result = output_bounded(cmd, Duration::from_secs(8));
     let _ = std::fs::remove_file(&tmp);
-    let result = result.map_err(|e| format!("Tesseract inaccessible : {e}"))?;
+    let result = result.map_err(|e| AppError::context("Tesseract inaccessible", e))?;
     if !result.status.success() {
-        return Err(format!(
-            "Tesseract : vérifie le moteur et les langues fra et eng ({})",
-            String::from_utf8_lossy(&result.stderr)
+        return Err(AppError::OcrExit {
+            code: result.status.code(),
+            detail: String::from_utf8_lossy(&result.stderr)
                 .chars()
                 .take(130)
-                .collect::<String>()
-        ));
+                .collect::<String>(),
+        });
     }
     Ok(String::from_utf8_lossy(&result.stdout).into_owned())
 }
@@ -165,27 +227,36 @@ pub fn analyze_panel(
     frame: &RgbaImage,
     panel: CaptureRect,
     exe: &Path,
-) -> Result<Option<Name>, String> {
+) -> Result<Option<Name>, AppError> {
+    let scale = panel.width as f32 / 413.0;
     let area = CaptureRect {
-        x: panel.x.saturating_add(77),
-        y: panel.y.saturating_add(40),
-        width: panel.width.saturating_sub(86),
-        height: 148,
+        x: panel.x.saturating_add((77.0 * scale).round() as u32),
+        y: panel.y.saturating_add((40.0 * scale).round() as u32),
+        width: panel.width.saturating_sub((86.0 * scale).round() as u32),
+        height: (148.0 * scale).round() as u32,
     };
-    let source = crate::vision::crop(frame, area).ok_or("En-tête HDV hors écran")?;
+    let source = crate::vision::crop(frame, area).ok_or(AppError::Domain(
+        crate::error::DomainError::HeaderOutsideScreen,
+    ))?;
     let resized = imageops::resize(
         &source,
         source.width() * 2,
         source.height() * 2,
         imageops::FilterType::CatmullRom,
     );
-    let first = recognize(&resized, exe, 6, "txt")?;
+    let raw = recognize(&resized, exe, 6, "tsv")?;
+    let first = tsv_lines(&raw)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let confidence = mean_confidence(&raw);
     // La structure des prix est DÉJÀ validée par le détecteur visuel.
     // Ne pas refuser systématiquement une vraie fiche parce que le texte
     // « Prix moyen » ou « Quantité » est mal lu par Tesseract.
     let score = metadata_score(&first);
     let candidate = extract_name(&first);
-    let verdict = if score >= 1 && !matches!(candidate, Name::Unreadable) {
+    let verdict = if score >= 1 && confidence >= 45.0 && !matches!(candidate, Name::Unreadable) {
         candidate
     } else {
         // Secours : seule la ligne de nom, agrandie et lue indépendamment.
@@ -202,7 +273,9 @@ pub fn analyze_panel(
                 .saturating_sub((15.0 * scale).round() as u32),
             height: (30.0 * scale).round() as u32,
         };
-        let source = crate::vision::crop(frame, title_area).ok_or("Titre de fiche hors écran")?;
+        let source = crate::vision::crop(frame, title_area).ok_or(AppError::Domain(
+            crate::error::DomainError::TitleOutsideScreen,
+        ))?;
         let enlarged = imageops::resize(
             &source,
             source.width() * 3,
@@ -213,7 +286,7 @@ pub fn analyze_panel(
         let other = extract_name(&isolated);
         crate::diagnostics::write(
             "OCR_SECOURS",
-            &format!(
+            format!(
                 "score {score}, titre isolé : {}",
                 isolated.trim().chars().take(90).collect::<String>()
             ),
@@ -227,7 +300,7 @@ pub fn analyze_panel(
     if matches!(verdict, Name::Unreadable) {
         crate::diagnostics::write(
             "OCR_REJET",
-            &format!(
+            format!(
                 "Nom illisible, score {score}. Texte : {}",
                 first.chars().take(130).collect::<String>()
             ),
@@ -373,6 +446,27 @@ struct Line {
     max_y: u32,
 }
 
+fn mean_confidence(tsv: &str) -> f32 {
+    let scores = tsv
+        .lines()
+        .skip(1)
+        .filter_map(|row| {
+            let fields = row.split('\t').collect::<Vec<_>>();
+            if fields.len() < 12 || fields[0] != "5" || fields[11].trim().is_empty() {
+                return None;
+            }
+            fields[10]
+                .parse::<f32>()
+                .ok()
+                .filter(|value| value.is_finite() && *value >= 0.0)
+        })
+        .collect::<Vec<_>>();
+    if scores.is_empty() {
+        0.0
+    } else {
+        scores.iter().sum::<f32>() / scores.len() as f32
+    }
+}
 fn tsv_lines(tsv: &str) -> Vec<(String, CaptureRect)> {
     let mut lines: BTreeMap<(u32, u32, u32), Line> = BTreeMap::new();
     for row in tsv.lines().skip(1) {
@@ -435,7 +529,7 @@ pub fn find_hover(
     panel: CaptureRect,
     prefix: &str,
     exe: &Path,
-) -> Result<Option<Hover>, String> {
+) -> Result<Option<Hover>, AppError> {
     let normalized_prefix = normalize(prefix);
     if normalized_prefix.len() < 9 {
         return Ok(None);
@@ -520,6 +614,55 @@ pub fn expanded_rect(panel: CaptureRect, text: CaptureRect, sw: u32, sh: u32) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    #[ignore = "Nécessite le moteur portable et une image synthétique fournis par HDV_TEST_OCR et HDV_TEST_FRAME"]
+    fn bundled_ocr_reads_a_synthetic_title_at_several_scales() {
+        let executable =
+            PathBuf::from(std::env::var_os("HDV_TEST_OCR").expect("HDV_TEST_OCR absent"));
+        let source =
+            image::open(std::env::var_os("HDV_TEST_FRAME").expect("HDV_TEST_FRAME absent"))
+                .unwrap()
+                .to_rgba8();
+        check_languages(&executable).unwrap();
+        for scale in [0.8_f32, 1.0, 1.25, 1.5] {
+            let frame = imageops::resize(
+                &source,
+                (source.width() as f32 * scale).round() as u32,
+                (source.height() as f32 * scale).round() as u32,
+                imageops::FilterType::Lanczos3,
+            );
+            let result = analyze_panel(
+                &frame,
+                CaptureRect {
+                    x: 0,
+                    y: 0,
+                    width: frame.width(),
+                    height: frame.height(),
+                },
+                &executable,
+            )
+            .unwrap();
+            let Some(Name::Complete(name)) = result else {
+                panic!("Titre incomplet à l'échelle {scale}: {result:?}")
+            };
+            assert_eq!(normalize(&name), "bottesphossiles", "échelle {scale}");
+        }
+    }
+    #[cfg(windows)]
+    #[test]
+    fn a_stuck_ocr_process_is_stopped_within_the_deadline() {
+        let mut command = Command::new("powershell.exe");
+        command.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "[System.Threading.Thread]::Sleep(15000)",
+        ]);
+        let start = Instant::now();
+        let error = output_bounded(command, Duration::from_millis(250)).unwrap_err();
+        assert!(matches!(error, AppError::OcrTimeout(_)));
+        assert!(start.elapsed() < Duration::from_secs(5));
+    }
     #[test]
     fn portable_runtime_precedes_system_but_keeps_user_override() {
         let app = Path::new("app");

@@ -2,6 +2,7 @@
 //! actions restore the application: automatic collection never steals focus.
 #[cfg(windows)]
 mod native {
+    use crate::error::AppError;
     use eframe::egui::{Context, ViewportCommand};
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     use std::{
@@ -132,10 +133,18 @@ mod native {
         hwnd: HWND,
     }
     impl Tray {
-        pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, String> {
-            let main_window = match cc.window_handle().map_err(|e| e.to_string())?.as_raw() {
+        pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self, AppError> {
+            let main_window = match cc
+                .window_handle()
+                .map_err(|e| AppError::context("Accès à la fenêtre", e))?
+                .as_raw()
+            {
                 RawWindowHandle::Win32(window) => window.hwnd.get(),
-                _ => return Err("La fenêtre Windows est indisponible".into()),
+                _ => {
+                    return Err(AppError::Domain(
+                        crate::error::DomainError::WindowUnavailable,
+                    ))
+                }
             };
             let ctx = cc.egui_ctx.clone();
             let (sender, receiver) = mpsc::sync_channel(1);
@@ -164,7 +173,9 @@ mod native {
                     std::ptr::null(),
                 );
                 if hwnd == 0 {
-                    let _ = sender.send(Err("Création de l'icône Windows impossible".into()));
+                    let _ = sender.send(Err(AppError::Domain(
+                        crate::error::DomainError::TrayCreation,
+                    )));
                     return;
                 }
                 let icon_handle = LoadIconW(instance, 1_u16 as usize as *const u16);
@@ -191,9 +202,9 @@ mod native {
                 if Shell_NotifyIconW(NIM_ADD, &state.icon) == 0 {
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     DestroyWindow(hwnd);
-                    let _ = sender.send(Err(
-                        "La zone de notification Windows est indisponible".into()
-                    ));
+                    let _ = sender.send(Err(AppError::Domain(
+                        crate::error::DomainError::TrayUnavailable,
+                    )));
                     return;
                 }
                 if sender.send(Ok(hwnd)).is_err() {
@@ -211,7 +222,7 @@ mod native {
             });
             receiver
                 .recv_timeout(Duration::from_secs(3))
-                .map_err(|e| e.to_string())?
+                .map_err(|e| AppError::context("Démarrage de l'icône Windows", e))?
                 .map(|hwnd| Self { hwnd })
         }
     }

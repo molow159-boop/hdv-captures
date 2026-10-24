@@ -1,4 +1,4 @@
-# Compilation facultative du moteur portable, sans installation systeme.
+﻿# Compilation facultative du moteur portable, sans installation systeme.
 [CmdletBinding()]
 param(
     [string]$WorkDirectory = (Join-Path $PSScriptRoot 'target\ocr-build'),

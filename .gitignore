@@ -23,3 +23,9 @@ config.json
 /qa-profile/
 Thumbs.db
 Desktop.ini
+
+/Envois/
+/Corbeille_captures/
+/Diagnostics_captures/
+profils.json
+config.json.bak

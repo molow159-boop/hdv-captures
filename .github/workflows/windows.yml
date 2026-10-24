@@ -1,5 +1,10 @@
 name: Windows
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    paths: ['src/**', 'tests/**', 'assets/icon.*', 'Cargo.toml', 'Cargo.lock', 'build.rs', '*.ps1', 'rust-toolchain.toml', '.github/workflows/windows.yml']
+  pull_request:
+    paths: ['src/**', 'tests/**', 'assets/icon.*', 'Cargo.toml', 'Cargo.lock', 'build.rs', '*.ps1', 'rust-toolchain.toml', '.github/workflows/windows.yml']
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -7,16 +12,26 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Installer Rust stable et les outils de verification
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup default stable
-      - name: Verifier et compiler
+      - name: Installer la chaîne vérifiée
+        run: rustup toolchain install 1.99.1 --profile minimal --component rustfmt --component clippy
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-rust-1.99.1-${{ hashFiles('Cargo.lock', 'Compiler-OCR.ps1') }}
+      - name: Vérifier les sources et compiler
         shell: pwsh
         run: |
           ./Compiler-Windows.ps1
+          ./Verifier-Licences.ps1
           ./Compiler-OCR.ps1
-          Copy-Item README.md, LICENSE, LICENCES-TIERS.txt, SECURITY.md target/release/
+          $env:HDV_TEST_OCR = (Resolve-Path "target/release/ocr/tesseract.exe").Path
+          $env:HDV_TEST_FRAME = (Resolve-Path "tests/fixtures/ocr-title.png").Path
+          cargo test --locked bundled_ocr_reads_a_synthetic_title_at_several_scales -- --ignored
+          if ($LASTEXITCODE -ne 0) { throw 'Test OCR complementaire en echec' }
+          Copy-Item README.md, VERIFICATIONS.md, LICENSE, LICENCES-TIERS.txt, SECURITY.md target/release/
       - uses: actions/upload-artifact@v4
         with:
           name: HDV-Captures-Windows-x64
@@ -24,6 +39,7 @@ jobs:
             target/release/hdv-captures.exe
             target/release/ocr/
             target/release/README.md
+            target/release/VERIFICATIONS.md
             target/release/LICENSE
             target/release/LICENCES-TIERS.txt
             target/release/SECURITY.md

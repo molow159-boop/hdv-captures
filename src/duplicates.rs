@@ -1,14 +1,67 @@
 //! Un objet = une identité normalisée, indépendamment des pixels et de la date.
 //! Recherche locale par nom pour éviter automatiquement les captures dupliquées.
+use crate::error::AppError;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
 
 static CAPTURE_FILES: Mutex<()> = Mutex::new(());
+pub fn ensure_plain_child(root: &Path, path: &Path) -> Result<(), AppError> {
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| AppError::Domain(crate::error::DomainError::PathOutsideFolder))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(AppError::Domain(
+                crate::error::DomainError::InvalidPathComponent,
+            ));
+        };
+        current.push(name);
+        if let Ok(metadata) = std::fs::symlink_metadata(&current) {
+            let mut link = metadata.file_type().is_symlink();
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                link |= metadata.file_attributes() & 0x400 != 0;
+            }
+            if link {
+                return Err(AppError::Domain(
+                    crate::error::DomainError::LinkedWorkingFolder,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+struct Snapshot {
+    modified: Option<SystemTime>,
+    checked: Instant,
+    items: HashMap<String, Vec<PathBuf>>,
+}
+static SNAPSHOTS: std::sync::LazyLock<Mutex<HashMap<PathBuf, Snapshot>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+pub fn invalidate(folder: &Path) {
+    if let Ok(mut snapshots) = SNAPSHOTS.lock() {
+        snapshots.remove(folder);
+    }
+}
+pub fn saved(folder: &Path, path: &Path, name: &str) {
+    if let Ok(mut snapshots) = SNAPSHOTS.lock() {
+        if let Some(snapshot) = snapshots.get_mut(folder) {
+            snapshot
+                .items
+                .insert(normalize_item(name), vec![path.to_path_buf()]);
+            snapshot.modified = std::fs::metadata(folder).and_then(|m| m.modified()).ok();
+        }
+    }
+}
 
-pub fn lock_capture_files() -> Result<MutexGuard<'static, ()>, String> {
+pub fn lock_capture_files() -> Result<MutexGuard<'static, ()>, AppError> {
     CAPTURE_FILES
         .lock()
-        .map_err(|_| "Une opération sur les captures s'est interrompue.".into())
+        .map_err(|_| AppError::Domain(crate::error::DomainError::CaptureFilesUnavailable))
 }
 
 /// Évite les faux doublons causés par accents, espaces, apostrophes et casse.
@@ -86,25 +139,62 @@ pub fn item_from_filename(path: &Path) -> Option<String> {
     }
 }
 
-pub fn png_files(folder: &Path) -> Result<Vec<PathBuf>, String> {
+pub fn png_files(folder: &Path) -> Result<Vec<PathBuf>, AppError> {
     let iter = match std::fs::read_dir(folder) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Lecture du dossier : {e}")),
+        Err(e) => return Err(AppError::context("Lecture du dossier", e)),
     };
     Ok(iter
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")))
+        .filter(|p| {
+            p.is_file()
+                && !p
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(".hdv-partial-"))
+                && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+        })
         .collect())
 }
 
 /// Cache disque réel, sans faire confiance aux anciennes images en mémoire.
 /// Permet de ne pas recréer un objet déjà présent après redémarrage.
-pub fn paths_for_item(folder: &Path, key: &str) -> Result<Vec<PathBuf>, String> {
-    Ok(png_files(folder)?
+pub fn paths_for_item(folder: &Path, key: &str) -> Result<Vec<PathBuf>, AppError> {
+    let modified = std::fs::metadata(folder).and_then(|m| m.modified()).ok();
+    let mut snapshots = SNAPSHOTS
+        .lock()
+        .map_err(|_| AppError::Domain(crate::error::DomainError::DuplicateIndexUnavailable))?;
+    if !snapshots.get(folder).is_some_and(|snapshot| {
+        snapshot.modified == modified && snapshot.checked.elapsed() < Duration::from_secs(2)
+    }) {
+        let mut items: HashMap<String, Vec<PathBuf>> = HashMap::new();
+        for path in png_files(folder)? {
+            if let Some(key) = item_from_filename(&path) {
+                items.entry(key).or_default().push(path);
+            }
+        }
+        if snapshots.len() >= 8 && !snapshots.contains_key(folder) {
+            if let Some(old) = snapshots.keys().next().cloned() {
+                snapshots.remove(&old);
+            }
+        }
+        snapshots.insert(
+            folder.to_path_buf(),
+            Snapshot {
+                modified,
+                checked: Instant::now(),
+                items,
+            },
+        );
+    }
+    Ok(snapshots
+        .get(folder)
+        .and_then(|snapshot| snapshot.items.get(key))
+        .cloned()
+        .unwrap_or_default()
         .into_iter()
-        .filter(|p| item_from_filename(p).is_some_and(|n| n == key))
+        .filter(|path| path.is_file())
         .collect())
 }
 

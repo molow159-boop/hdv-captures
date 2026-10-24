@@ -8,7 +8,8 @@ use std::{
 pub fn path() -> PathBuf {
     crate::settings::config_path().with_file_name("diagnostic.log")
 }
-pub fn write(kind: &str, detail: &str) {
+pub fn write(kind: &str, detail: impl std::fmt::Display) {
+    let detail = detail.to_string();
     let path = path();
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);

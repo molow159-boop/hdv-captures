@@ -12,6 +12,8 @@ pub struct CaptureRect {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    #[serde(skip)]
+    pub runtime_session: String,
     pub automatic: bool,
     pub compact: bool,
     /// La collecte fonctionne aussi quand les panneaux galerie et aperçu sont masques.
@@ -32,6 +34,7 @@ impl Default for Settings {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
         Self {
+            runtime_session: String::new(),
             automatic: false,
             compact: false,
             show_gallery: true,
@@ -54,11 +57,28 @@ pub fn config_path() -> PathBuf {
     base.join("HDV Captures").join("config.json")
 }
 
+pub fn load_checked(path: &Path) -> (Settings, Option<String>) {
+    match std::fs::read(path) {
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(settings) => (settings, None),
+            Err(error) => {
+                let backup = path.with_extension("json.bak");
+                let recovered = std::fs::read(&backup)
+                    .ok()
+                    .and_then(|data| serde_json::from_slice(&data).ok());
+                (recovered.unwrap_or_default(), Some(format!(
+                    "Paramètres illisibles ({error}). Sauvegarde récupérée si disponible ; vérifie tes réglages.")))
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Settings::default(), None),
+        Err(error) => (
+            Settings::default(),
+            Some(format!("Lecture des paramètres impossible : {error}")),
+        ),
+    }
+}
 pub fn load(path: &Path) -> Settings {
-    std::fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Settings>(&bytes).ok())
-        .unwrap_or_default()
+    load_checked(path).0
 }
 
 pub fn store(path: &Path, settings: &Settings) -> std::io::Result<()> {
@@ -66,14 +86,55 @@ pub fn store(path: &Path, settings: &Settings) -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let bytes = serde_json::to_vec_pretty(settings).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(tmp, path)
+    static WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let _guard = WRITER
+        .lock()
+        .map_err(|_| std::io::Error::other("Verrou des paramètres indisponible"))?;
+    let tmp = path.with_extension(format!(
+        "json.{}.{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Ok(previous) = std::fs::read(path) {
+        if serde_json::from_slice::<Settings>(&previous).is_ok() {
+            std::fs::write(path.with_extension("json.bak"), previous)?;
+        }
+    }
+    let mut file = std::fs::File::create(&tmp)?;
+    use std::io::Write;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    drop(file);
+    let result = std::fs::rename(&tmp, path);
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
 }
 
 #[cfg(test)]
 mod gallery_tests {
     use super::*;
+    #[test]
+    fn invalid_configuration_recovers_last_valid_backup_without_overwriting_it() {
+        let folder =
+            std::env::temp_dir().join(format!("hdv-settings-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("config.json");
+        let original = Settings {
+            export_chunk_size: 123,
+            ..Default::default()
+        };
+        store(&path, &original).unwrap();
+        store(&path, &Settings::default()).unwrap();
+        std::fs::write(&path, b"invalid").unwrap();
+        let (recovered, warning) = load_checked(&path);
+        assert!(warning.is_some());
+        assert_eq!(recovered.export_chunk_size, 123);
+        assert_eq!(std::fs::read(&path).unwrap(), b"invalid");
+        std::fs::remove_dir_all(folder).unwrap();
+    }
     #[test]
     fn old_settings_default_to_visible_gallery() {
         let saved = r#"{"automatic":false,"compact":false}"#;

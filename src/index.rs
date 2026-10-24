@@ -1,11 +1,12 @@
 //! Catalogue local SQLite (aucun envoi réseau).
 use crate::duplicates;
+use crate::error::AppError;
+use crate::state::VisitState;
 use chrono::Local;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::OnceLock,
     time::Duration,
 };
 #[derive(Default, Clone)]
@@ -23,7 +24,7 @@ fn storage() -> PathBuf {
     {
         // Even `cargo test` on an installed user's machine must never open
         // their real capture database. All writer tests share this fresh file.
-        static TEST_DATABASE: OnceLock<PathBuf> = OnceLock::new();
+        static TEST_DATABASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
         TEST_DATABASE
             .get_or_init(|| {
                 std::env::temp_dir().join(format!(
@@ -35,45 +36,82 @@ fn storage() -> PathBuf {
             .clone()
     }
 }
-static DATABASE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
-fn connect() -> Result<Connection, String> {
+static DATABASE_INIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DATABASE_WRITER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+struct Database {
+    connection: Connection,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+impl std::ops::Deref for Database {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+impl std::ops::DerefMut for Database {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+fn connect() -> Result<Database, AppError> {
+    let guard = DATABASE_WRITER
+        .lock()
+        .map_err(|_| AppError::Domain(crate::error::DomainError::DatabaseUnavailable))?;
     let path = storage();
-    DATABASE_INIT.get_or_init(|| {
-  if let Some(dir)=path.parent(){fs::create_dir_all(dir).map_err(|e|e.to_string())?;}
-  let init=Connection::open(&path).map_err(|e|e.to_string())?;
-  init.busy_timeout(Duration::from_secs(1)).map_err(|e|e.to_string())?;
-  init.execute_batch("PRAGMA journal_mode=WAL;
+    if !DATABASE_INIT.load(std::sync::atomic::Ordering::Relaxed) {
+        (|| -> Result<(), AppError> {
+            if let Some(dir) = path.parent() {
+                fs::create_dir_all(dir).map_err(AppError::from)?;
+            }
+            let init = Connection::open(&path).map_err(AppError::from)?;
+            init.busy_timeout(Duration::from_secs(1))
+                .map_err(AppError::from)?;
+            init.execute_batch("PRAGMA journal_mode=WAL;
   CREATE TABLE IF NOT EXISTS items(path TEXT PRIMARY KEY,folder TEXT NOT NULL,item_key TEXT NOT NULL,item_name TEXT NOT NULL,
   captured_at TEXT NOT NULL,prepared_at TEXT,quality TEXT NOT NULL);
   CREATE INDEX IF NOT EXISTS idx_item ON items(folder,item_key);
+  CREATE TABLE IF NOT EXISTS export_operations(id TEXT PRIMARY KEY);
   CREATE TABLE IF NOT EXISTS visits(
       id INTEGER PRIMARY KEY, folder TEXT NOT NULL, item_name TEXT NOT NULL DEFAULT '',
       state TEXT NOT NULL, reason TEXT NOT NULL, observed_at TEXT NOT NULL,
       evidence TEXT NOT NULL DEFAULT '', session_id TEXT NOT NULL DEFAULT '');
   CREATE INDEX IF NOT EXISTS idx_visits ON visits(folder,id DESC);")
-      .map_err(|e|e.to_string())?;
-  // Migration idempotente pour les utilisateurs d'une version de test 0.2.5.
-  let _=init.execute("ALTER TABLE visits ADD COLUMN evidence TEXT NOT NULL DEFAULT ''",[]);
-  let _=init.execute("ALTER TABLE visits ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",[]);
-  Ok(())
- }).as_ref().map_err(|e|e.clone())?;
+      .map_err(AppError::from)?;
+            // Migration idempotente pour les utilisateurs d'une version de test 0.2.5.
+            let _ = init.execute(
+                "ALTER TABLE visits ADD COLUMN evidence TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            let _ = init.execute(
+                "ALTER TABLE visits ADD COLUMN session_id TEXT NOT NULL DEFAULT ''",
+                [],
+            );
+            Ok(())
+        })()?;
+        DATABASE_INIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     // Ne jamais bloquer l'interface pendant quatre secondes sur un verrou SQL.
-    let conn = Connection::open(&path).map_err(|e| e.to_string())?;
-    conn.busy_timeout(Duration::from_millis(300))
-        .map_err(|e| e.to_string())?;
-    Ok(conn)
+    let conn = Connection::open(&path).map_err(AppError::from)?;
+    conn.busy_timeout(Duration::from_secs(3))
+        .map_err(AppError::from)?;
+    Ok(Database {
+        connection: conn,
+        _guard: guard,
+    })
 }
 fn folder_key(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
-pub fn sync(folder: &Path) -> Result<(), String> {
+pub fn sync(folder: &Path) -> Result<(), AppError> {
     let _guard = duplicates::lock_capture_files()?;
     sync_files(folder)
 }
 
-fn sync_files(folder: &Path) -> Result<(), String> {
+fn sync_files(folder: &Path) -> Result<(), AppError> {
     let mut db = connect()?;
-    let tx = db.transaction().map_err(|e| e.to_string())?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(AppError::from)?;
     for file in duplicates::png_files(folder)? {
         let Some(key) = duplicates::item_from_filename(&file) else {
             continue;
@@ -82,16 +120,16 @@ fn sync_files(folder: &Path) -> Result<(), String> {
         let label = label.split("__").next().unwrap_or(&label).to_owned();
         tx.execute("INSERT OR IGNORE INTO items(path,folder,item_key,item_name,captured_at,quality) VALUES (?1,?2,?3,?4,?5,'historique à vérifier')",
     params![file.to_string_lossy().as_ref(),folder_key(folder),key,label,Local::now().to_rfc3339()])
-    .map_err(|e|e.to_string())?;
+    .map_err(AppError::from)?;
     }
     let mut stmt = tx
         .prepare("SELECT path FROM items WHERE folder=?1")
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     let paths = stmt
         .query_map(params![folder_key(folder)], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>();
+        .map_err(AppError::from)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(AppError::from)?;
     drop(stmt);
     for p in paths {
         if !Path::new(&p).is_file() {
@@ -99,66 +137,208 @@ fn sync_files(folder: &Path) -> Result<(), String> {
                 "DELETE FROM items WHERE path=?1 AND prepared_at IS NULL",
                 params![p],
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(AppError::from)?;
         }
     }
-    tx.commit().map_err(|e| e.to_string())
+    tx.commit().map_err(AppError::from)
 }
-pub fn saved(folder: &Path, path: &Path, name: &str, quality: &str) -> Result<(), String> {
+pub fn saved(folder: &Path, path: &Path, name: &str, quality: &str) -> Result<(), AppError> {
     let db = connect()?;
     db.execute("INSERT INTO items(path,folder,item_key,item_name,captured_at,prepared_at,quality) VALUES(?1,?2,?3,?4,?5,NULL,?6)
  ON CONFLICT(path) DO UPDATE SET item_key=excluded.item_key,item_name=excluded.item_name,captured_at=excluded.captured_at,
  prepared_at=NULL,quality=excluded.quality",
  params![path.to_string_lossy().as_ref(),folder_key(folder),duplicates::normalize_item(name),name,Local::now().to_rfc3339(),quality])
- .map_err(|e|e.to_string())?;
+ .map_err(AppError::from)?;
     Ok(())
 }
-pub fn stats(folder: &Path) -> Result<Stats, String> {
+pub fn stats(folder: &Path) -> Result<Stats, AppError> {
     let db = connect()?;
     let (total,prepared):(i64,i64)=db.query_row(
  "SELECT COUNT(*), COALESCE(SUM(CASE WHEN prepared_at IS NOT NULL THEN 1 ELSE 0 END),0) FROM items WHERE folder=?1",
- params![folder_key(folder)],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?;
+ params![folder_key(folder)],|r|Ok((r.get(0)?,r.get(1)?))).map_err(AppError::from)?;
     Ok(Stats {
         total: total as usize,
         pending: (total - prepared) as usize,
         prepared: prepared as usize,
     })
 }
-pub fn prepared_paths(folder: &Path) -> Result<std::collections::HashSet<PathBuf>, String> {
+pub fn prepared_paths(folder: &Path) -> Result<std::collections::HashSet<PathBuf>, AppError> {
     let db = connect()?;
     let mut stmt = db
         .prepare("SELECT path FROM items WHERE folder=?1 AND prepared_at IS NOT NULL")
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     let names = stmt
         .query_map(params![folder_key(folder)], |r| r.get::<_, String>(0))
-        .map_err(|e| e.to_string())?
-        .filter_map(Result::ok)
+        .map_err(AppError::from)?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(AppError::from)?
+        .into_iter()
         .map(PathBuf::from)
         .collect();
     Ok(names)
 }
-fn was_prepared(path: &Path) -> Result<bool, String> {
-    let db = connect()?;
-    let found: Option<String> = db
-        .query_row(
-            "SELECT prepared_at FROM items WHERE path=?1",
-            params![path.to_string_lossy().as_ref()],
-            |r| r.get(0),
-        )
-        .optional()
-        .map_err(|e| e.to_string())?
-        .flatten();
-    Ok(found.is_some())
-}
 
-pub fn item_prepared(folder: &Path, key: &str) -> Result<bool, String> {
+pub fn item_prepared(folder: &Path, key: &str) -> Result<bool, AppError> {
     connect()?
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM items WHERE folder=?1 AND item_key=?2 AND prepared_at IS NOT NULL)",
             params![folder_key(folder), key],
             |row| row.get(0),
         )
-        .map_err(|e| e.to_string())
+        .map_err(AppError::from)
+}
+
+pub fn recover_preparations(folder: &Path) -> Result<usize, AppError> {
+    let _guard = duplicates::lock_capture_files()?;
+    let directory = folder.join("Envois");
+    duplicates::ensure_plain_child(folder, &directory)?;
+    if !directory.is_dir() {
+        return Ok(0);
+    }
+    let mut recovered = 0;
+    for entry in fs::read_dir(&directory).map_err(AppError::from)? {
+        let path = entry.map_err(AppError::from)?.path();
+        if !path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with(".preparation-"))
+        {
+            continue;
+        }
+        let journal: crate::batches::MoveJournal =
+            serde_json::from_slice(&fs::read(&path).map_err(AppError::from)?)
+                .map_err(|e| AppError::context("Journal de préparation illisible", e))?;
+        let committed: bool = connect()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM export_operations WHERE id=?1)",
+                params![journal.id],
+                |r| r.get(0),
+            )
+            .map_err(AppError::from)?;
+        if !committed {
+            let has_parent =
+                |p: &Path| p.components().any(|c| c == std::path::Component::ParentDir);
+            for (source, target) in journal.files.iter().rev() {
+                if source.parent() != Some(folder)
+                    || !target.starts_with(&directory)
+                    || has_parent(target)
+                {
+                    return Err(AppError::Domain(
+                        crate::error::DomainError::JournalOutsideFolder,
+                    ));
+                }
+                if target.exists() {
+                    duplicates::ensure_plain_child(folder, target)?;
+                    if !target
+                        .canonicalize()
+                        .map_err(AppError::from)?
+                        .starts_with(directory.canonicalize().map_err(AppError::from)?)
+                    {
+                        return Err(AppError::Domain(
+                            crate::error::DomainError::JournalEscapesExports,
+                        ));
+                    }
+                    if source.exists() {
+                        return Err(AppError::Domain(
+                            crate::error::DomainError::RecoveryConflict,
+                        ));
+                    }
+                    fs::rename(target, source).map_err(AppError::from)?;
+                }
+            }
+            if let Some(batch) = journal
+                .batch
+                .filter(|p| p.parent() == Some(directory.as_path()))
+            {
+                let _ = fs::remove_file(batch.join("captures.csv"));
+                for sub in journal
+                    .directories
+                    .iter()
+                    .rev()
+                    .filter(|p| p.parent() == Some(batch.as_path()))
+                {
+                    let _ = fs::remove_dir(sub);
+                }
+                let _ = fs::remove_dir(batch);
+            }
+            recovered += 1;
+        }
+        fs::remove_file(path).map_err(AppError::from)?;
+    }
+    Ok(recovered)
+}
+
+pub fn attach_evidence(folder: &Path, id: i64, path: &Path) -> Result<(), AppError> {
+    connect()?
+        .execute(
+            "UPDATE visits SET evidence=?3 WHERE folder=?1 AND id=?2 AND evidence=''",
+            params![folder_key(folder), id, path.to_string_lossy().as_ref()],
+        )
+        .map_err(AppError::from)?;
+    Ok(())
+}
+
+pub fn rename_capture(folder: &Path, path: &Path, name: &str) -> Result<PathBuf, AppError> {
+    let _guard = duplicates::lock_capture_files()?;
+    if path.parent() != Some(folder) || !path.is_file() {
+        return Err(AppError::Domain(
+            crate::error::DomainError::CaptureOutsideFolder,
+        ));
+    }
+    let name = name.trim();
+    if name.is_empty() || crate::worker::safe_item_filename(name) != name {
+        return Err(AppError::Domain(crate::error::DomainError::InvalidName));
+    }
+    let key = duplicates::normalize_item(name);
+    if key.is_empty() {
+        return Err(AppError::Domain(crate::error::DomainError::EmptyIdentity));
+    }
+    if duplicates::paths_for_item(folder, &key)?
+        .iter()
+        .any(|other| other != path)
+        || item_prepared(folder, &key)?
+    {
+        return Err(AppError::Domain(
+            crate::error::DomainError::DuplicateIdentity,
+        ));
+    }
+    let target = folder.join(format!("{name}.png"));
+    if target == path {
+        return Ok(target);
+    }
+    if target.exists() {
+        return Err(AppError::Domain(
+            crate::error::DomainError::ExistingFilename,
+        ));
+    }
+    let mut db = connect()?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(AppError::from)?;
+    fs::rename(path, &target).map_err(AppError::from)?;
+    let result = tx
+        .execute(
+            "UPDATE items SET path=?2,item_name=?3,item_key=?4 WHERE path=?1 AND folder=?5",
+            params![
+                path.to_string_lossy().as_ref(),
+                target.to_string_lossy().as_ref(),
+                name,
+                key,
+                folder_key(folder)
+            ],
+        )
+        .and_then(|_| tx.commit());
+    if let Err(error) = result {
+        if let Err(restore) = fs::rename(&target, path) {
+            return Err(AppError::Rollback {
+                database: error,
+                restore,
+                retained: target.clone(),
+            });
+        }
+        return Err(error.into());
+    }
+    duplicates::invalidate(folder);
+    Ok(target)
 }
 
 pub struct ExportResult {
@@ -174,6 +354,7 @@ struct PendingMoves {
     committed: bool,
     batch: Option<PathBuf>,
     directories: Vec<PathBuf>,
+    journal: Option<PathBuf>,
 }
 impl Drop for PendingMoves {
     fn drop(&mut self) {
@@ -184,7 +365,7 @@ impl Drop for PendingMoves {
                     restored = false;
                     crate::diagnostics::write(
                         "ENVOI",
-                        &format!(
+                        format!(
                             "Retour impossible, original présent : {}. Image conservée : {}",
                             source.display(),
                             destination.display()
@@ -194,7 +375,7 @@ impl Drop for PendingMoves {
                     restored = false;
                     crate::diagnostics::write(
                         "ENVOI",
-                        &format!("Image conservée dans {} : {e}", destination.display()),
+                        format!("Image conservée dans {} : {e}", destination.display()),
                     );
                 }
             }
@@ -206,15 +387,28 @@ impl Drop for PendingMoves {
                     }
                     let _ = fs::remove_dir(batch);
                 }
+                if let Some(journal) = &self.journal {
+                    let _ = fs::remove_file(journal);
+                }
             }
         }
     }
 }
 
-pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult, String> {
+pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult, AppError> {
+    prepare_selection(folder, chunk_size, None)
+}
+pub fn prepare_selection(
+    folder: &Path,
+    chunk_size: Option<usize>,
+    selected: Option<&std::collections::HashSet<PathBuf>>,
+) -> Result<ExportResult, AppError> {
     if chunk_size == Some(0) {
-        return Err("Le maximum de captures par dossier doit être au moins égal à 1.".into());
+        return Err(AppError::Domain(
+            crate::error::DomainError::InvalidChunkSize,
+        ));
     }
+    recover_preparations(folder)?;
     let _guard = duplicates::lock_capture_files()?;
     sync_files(folder)?;
     let batch_base = folder.join("Envois");
@@ -228,12 +422,16 @@ pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult,
     let mut pending = Vec::new();
     let mut already_prepared = Vec::new();
     let mut skipped = 0;
+    let prepared = prepared_paths(folder)?;
     for file in duplicates::png_files(folder)? {
+        if selected.is_some_and(|paths| !paths.contains(&file)) {
+            continue;
+        }
         if duplicates::item_from_filename(&file).is_none() {
             skipped += 1;
             continue;
         }
-        if was_prepared(&file)? {
+        if prepared.contains(&file) {
             already_prepared.push(file);
             continue;
         }
@@ -253,13 +451,13 @@ pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult,
     pending.sort();
     let mut moves = PendingMoves::default();
     if !pending.is_empty() {
-        fs::create_dir_all(&batch_base).map_err(|e| e.to_string())?;
-        fs::create_dir(&batch).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&batch_base).map_err(AppError::from)?;
+        fs::create_dir(&batch).map_err(AppError::from)?;
         moves.batch = Some(batch.clone());
         if let Some(limit) = chunk_size {
             for number in 1..=pending.len().div_ceil(limit) {
                 let directory = batch.join(number.to_string());
-                fs::create_dir(&directory).map_err(|e| e.to_string())?;
+                fs::create_dir(&directory).map_err(AppError::from)?;
                 moves.directories.push(directory);
             }
         }
@@ -280,16 +478,54 @@ pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult,
                 relative_path
             ));
         }
-        fs::write(batch.join("captures.csv"), csv).map_err(|e| e.to_string())?;
+        fs::write(batch.join("captures.csv"), csv).map_err(AppError::from)?;
     }
     let archive = batch_base.join("Deja_preparees");
     if !already_prepared.is_empty() {
-        fs::create_dir_all(&archive).map_err(|e| e.to_string())?;
+        fs::create_dir_all(&archive).map_err(AppError::from)?;
+    }
+    let operation_id = format!(
+        "{}-{}",
+        std::process::id(),
+        Local::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    let planned = pending
+        .iter()
+        .enumerate()
+        .map(|(position, file)| {
+            let directory = match chunk_size {
+                Some(limit) => batch.join((position / limit + 1).to_string()),
+                None => batch.clone(),
+            };
+            (
+                file.clone(),
+                directory.join(file.file_name().unwrap_or_default()),
+            )
+        })
+        .chain(already_prepared.iter().map(|file| {
+            let name = file.file_name().unwrap_or_default();
+            let mut target = archive.join(name);
+            let mut suffix = 2;
+            while target.exists() {
+                target = archive.join(format!("{suffix}_{}", name.to_string_lossy()));
+                suffix += 1;
+            }
+            (file.clone(), target)
+        }))
+        .collect::<Vec<_>>();
+    if !planned.is_empty() {
+        let journal = crate::batches::MoveJournal {
+            id: operation_id.clone(),
+            files: planned.clone(),
+            batch: moves.batch.clone(),
+            directories: moves.directories.clone(),
+        };
+        moves.journal = Some(crate::batches::write_journal(folder, &journal)?);
     }
     let mut db = connect()?;
     let tx = db
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     for (files, directory, split) in [
         (&pending, &batch, true),
         (&already_prepared, &archive, false),
@@ -299,24 +535,43 @@ pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult,
                 Some(limit) => directory.join((position / limit + 1).to_string()),
                 None => directory.clone(),
             };
-            let name = file.file_name().ok_or("PNG sans nom")?;
+            let name = file
+                .file_name()
+                .ok_or(AppError::Domain(crate::error::DomainError::MissingPngName))?;
             let mut target = directory.join(name);
             let mut suffix = 2;
             while target.exists() {
                 target = directory.join(format!("{suffix}_{}", name.to_string_lossy()));
                 suffix += 1;
             }
+            let target = planned
+                .iter()
+                .find(|(source, _)| source == file)
+                .map(|(_, target)| target.clone())
+                .ok_or(AppError::Domain(crate::error::DomainError::UnjournaledMove))?;
+            if target.exists() {
+                return Err(AppError::Domain(crate::error::DomainError::ExportCollision));
+            }
             fs::rename(file, &target)
-                .map_err(|e| format!("Déplacement {} : {e}", file.display()))?;
+                .map_err(|e| AppError::context(format!("Déplacement {}", file.display()), e))?;
             moves.files.push((file.clone(), target.clone()));
             tx.execute(
                 "UPDATE items SET path=?2,prepared_at=COALESCE(prepared_at,?3) WHERE path=?1 AND folder=?4",
                 params![file.to_string_lossy().as_ref(), target.to_string_lossy().as_ref(), Local::now().to_rfc3339(), folder_key(folder)],
-            ).map_err(|e| e.to_string())?;
+            ).map_err(AppError::from)?;
         }
     }
-    tx.commit().map_err(|e| e.to_string())?;
+    tx.execute(
+        "INSERT INTO export_operations(id) VALUES(?1)",
+        params![operation_id],
+    )
+    .map_err(AppError::from)?;
+    tx.commit().map_err(AppError::from)?;
     moves.committed = true;
+    duplicates::invalidate(folder);
+    if let Some(journal) = &moves.journal {
+        let _ = fs::remove_file(journal);
+    }
     Ok(ExportResult {
         path: if pending.is_empty() { archive } else { batch },
         moved: pending.len(),
@@ -327,6 +582,101 @@ pub fn prepare(folder: &Path, chunk_size: Option<usize>) -> Result<ExportResult,
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selected_export_and_rename_keep_other_images_unchanged() {
+        let folder = export_folder("selection");
+        let a = folder.join("Objet Alpha.png");
+        let b = folder.join("Objet Beta.png");
+        png(&a);
+        png(&b);
+        sync(&folder).unwrap();
+        let bytes = fs::read(&b).unwrap();
+        assert!(rename_capture(&folder, &a, "Objet Beta").is_err());
+        let renamed = rename_capture(&folder, &a, "Objet Corrige").unwrap();
+        assert!(!a.exists());
+        assert!(renamed.exists());
+        let selection = [renamed].into_iter().collect();
+        let batch = prepare_selection(&folder, Some(1), Some(&selection)).unwrap();
+        assert_eq!(batch.moved, 1);
+        assert_eq!(fs::read(&b).unwrap(), bytes);
+        assert!(batch.path.join("1/Objet Corrige.png").exists());
+    }
+    #[test]
+    fn uncommitted_export_is_recovered_after_process_interruption() {
+        let folder = export_folder("crash-rollback");
+        let source = folder.join("Objet Conserve.png");
+        png(&source);
+        sync(&folder).unwrap();
+        let batch = folder.join("Envois/lot_interrompu");
+        fs::create_dir_all(&batch).unwrap();
+        let target = batch.join("Objet Conserve.png");
+        let journal = crate::batches::MoveJournal {
+            id: "test-uncommitted".into(),
+            files: vec![(source.clone(), target.clone())],
+            batch: Some(batch.clone()),
+            directories: vec![],
+        };
+        crate::batches::write_journal(&folder, &journal).unwrap();
+        fs::rename(&source, &target).unwrap();
+        assert_eq!(recover_preparations(&folder).unwrap(), 1);
+        assert!(source.exists());
+        assert!(!target.exists());
+        assert_eq!(recover_preparations(&folder).unwrap(), 0);
+    }
+    #[test]
+    fn committed_export_is_not_rolled_back_after_interruption() {
+        let folder = export_folder("crash-commit");
+        let source = folder.join("Objet Conserve.png");
+        png(&source);
+        let batch = prepare(&folder, None).unwrap();
+        let target = batch.path.join("Objet Conserve.png");
+        let id = format!(
+            "test-committed-{}",
+            Local::now().timestamp_nanos_opt().unwrap()
+        );
+        connect()
+            .unwrap()
+            .execute("INSERT INTO export_operations(id) VALUES(?1)", params![id])
+            .unwrap();
+        let journal = crate::batches::MoveJournal {
+            id,
+            files: vec![(source.clone(), target.clone())],
+            batch: Some(batch.path),
+            directories: vec![],
+        };
+        crate::batches::write_journal(&folder, &journal).unwrap();
+        assert_eq!(recover_preparations(&folder).unwrap(), 0);
+        assert!(target.exists());
+        assert!(!source.exists());
+    }
+    #[test]
+    fn concurrent_history_writes_are_not_lost() {
+        let folder = export_folder("writers");
+        let base = Local::now().timestamp_micros() * 1000;
+        let workers = (0..12)
+            .map(|worker| {
+                let folder = folder.clone();
+                std::thread::spawn(move || {
+                    for sequence in 0..20 {
+                        let record = VisitRecord {
+                            id: base + worker * 1000 + sequence,
+                            name: "Objet Test".into(),
+                            state: VisitState::Saved,
+                            reason: "test".into(),
+                            observed_at: "test".into(),
+                            evidence: String::new(),
+                            session_id: "test".into(),
+                        };
+                        store_visit(&folder, &record).unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(recent_visits(&folder, 1000).unwrap().len(), 240);
+    }
     #[test]
     fn stats_default_is_zero() {
         let s = Stats::default();
@@ -457,8 +807,11 @@ mod tests {
         let db = connect().unwrap();
         let escaped = folder_key(&folder).replace('\'', "''");
         db.execute_batch(&format!("CREATE TRIGGER test_export_failure BEFORE UPDATE ON items WHEN OLD.folder='{escaped}' BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;")).unwrap();
+        drop(db);
         assert!(prepare(&folder, Some(1)).is_err());
-        db.execute_batch("DROP TRIGGER test_export_failure")
+        connect()
+            .unwrap()
+            .execute_batch("DROP TRIGGER test_export_failure")
             .unwrap();
         assert_eq!(fs::read(&file).unwrap(), bytes);
         assert_eq!(fs::read_dir(folder.join("Envois")).unwrap().count(), 0);
@@ -470,270 +823,9 @@ mod tests {
 /// Historique des fiches réellement observées, y compris celles qui n'ont
 /// jamais donné de PNG. Une entrée sans nom fiable reste « fiche non identifiée »
 /// et ne doit jamais être présentée comme un objet précis.
-#[derive(Clone, Debug)]
-pub struct VisitRecord {
-    pub id: i64,
-    pub name: String,
-    pub state: String,
-    pub reason: String,
-    pub observed_at: String,
-    pub evidence: String,
-    /// Identifiant de lancement: ne pas lier des objets de deux sessions.
-    pub session_id: String,
-}
-pub fn store_visit(folder: &Path, v: &VisitRecord) -> Result<(), String> {
-    let db = connect()?;
-    db.execute("INSERT INTO visits(id,folder,item_name,state,reason,observed_at,evidence,session_id)
-        VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
-        ON CONFLICT(id) DO UPDATE SET
-          item_name=CASE WHEN excluded.item_name <> '' THEN excluded.item_name ELSE visits.item_name END,
-          state=excluded.state, reason=excluded.reason,
-          session_id=CASE WHEN visits.session_id = '' THEN excluded.session_id ELSE visits.session_id END,
-          evidence=CASE WHEN excluded.evidence <> '' THEN excluded.evidence ELSE visits.evidence END",
-        params![v.id,folder_key(folder),v.name,v.state,v.reason,v.observed_at,v.evidence,v.session_id])
-        .map_err(|e|e.to_string())?;
-    Ok(())
-}
-/// Ne modifie jamais les PNG ni les images de contrôle ; uniquement le suivi SQLite.
-pub fn delete_visit(folder: &Path, id: i64) -> Result<usize, String> {
-    let db = connect()?;
-    db.execute(
-        "DELETE FROM visits WHERE folder=?1 AND id=?2",
-        params![folder_key(folder), id],
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// Select and remove the same rows atomically, returning tombstones for late OCR.
-pub fn clear_visits_with_ids(folder: &Path, only_missing: bool) -> Result<Vec<i64>, String> {
-    let mut db = connect()?;
-    clear_visits_on(&mut db, &folder_key(folder), only_missing)
-}
-
-fn clear_visits_on(
-    db: &mut Connection,
-    folder: &str,
-    only_missing: bool,
-) -> Result<Vec<i64>, String> {
-    // Reserve the writer before reading ids: a deferred read transaction cannot
-    // be upgraded if a concurrent gallery/export write changes its WAL snapshot.
-    let tx = db
-        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-        .map_err(|e| e.to_string())?;
-    let condition = if only_missing {
-        "folder=?1 AND state IN ('a_reprendre','en_attente')"
-    } else {
-        "folder=?1"
-    };
-    let ids = {
-        let mut statement = tx
-            .prepare(&format!("SELECT id FROM visits WHERE {condition}"))
-            .map_err(|e| e.to_string())?;
-        let rows = statement
-            .query_map(params![folder], |row| row.get::<_, i64>(0))
-            .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| e.to_string())?
-    };
-    tx.execute(
-        &format!("DELETE FROM visits WHERE {condition}"),
-        params![folder],
-    )
-    .map_err(|e| e.to_string())?;
-    tx.commit().map_err(|e| e.to_string())?;
-    Ok(ids)
-}
-
-pub fn recent_visits(folder: &Path, limit: usize) -> Result<Vec<VisitRecord>, String> {
-    let db = connect()?;
-    let mut stmt = db
-        .prepare(
-            "SELECT id,item_name,state,reason,observed_at,evidence,session_id FROM visits
-                             WHERE folder=?1 ORDER BY id DESC LIMIT ?2",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![folder_key(folder), limit as i64], |row| {
-            Ok(VisitRecord {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                state: row.get(2)?,
-                reason: row.get(3)?,
-                observed_at: row.get(4)?,
-                evidence: row.get(5)?,
-                session_id: row.get(6)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-    Ok(rows.filter_map(Result::ok).collect())
-}
-/// Repères de navigation pour une fiche anonyme, sans inventer son identité.
-/// `visits` est trié du plus récent au plus ancien (ordre de détection, pas
-/// de fin d'OCR). Les noms sont fiables UNIQUEMENT après sauvegarde.
-#[derive(Default, Debug, Clone, PartialEq, Eq)]
-pub struct Neighbors {
-    pub before: Option<String>,
-    pub after: Option<String>,
-    pub ambiguous: usize,
-}
-pub fn visit_neighbors(visits: &[VisitRecord], index: usize) -> Neighbors {
-    let Some(v) = visits.get(index) else {
-        return Neighbors::default();
-    };
-    if v.session_id.is_empty() {
-        return Neighbors::default();
-    }
-    let named = |r: &VisitRecord| {
-        r.session_id == v.session_id && r.state == "enregistre" && !r.name.trim().is_empty()
-    };
-    // Les IDs sont attribués à l'ouverture, avant que l'OCR asynchrone finisse.
-    let before_idx = (index + 1..visits.len()).find(|&i| named(&visits[i]));
-    let after_idx = (0..index).rev().find(|&i| named(&visits[i]));
-    let before = before_idx.map(|i| visits[i].name.clone());
-    let after = after_idx.map(|i| visits[i].name.clone());
-    let ambiguous = match (before_idx, after_idx) {
-        (Some(b), Some(a)) if a + 1 < b => visits[a + 1..b]
-            .iter()
-            .filter(|r| r.session_id == v.session_id && r.state != "enregistre")
-            .count(),
-        _ => 0,
-    };
-    Neighbors {
-        before,
-        after,
-        ambiguous,
-    }
-}
-
-pub fn export_missing(folder: &Path) -> Result<(PathBuf, usize), String> {
-    let visits = recent_visits(folder, 10000)?;
-    let path = folder.join("Objets_a_reprendre.csv");
-    let mut text=String::from("\u{FEFF}date;objet;statut;raison;capture_de_controle;objet_avant;objet_apres;fiches_non_confirmees_entre_les_deux\n");
-    let mut count = 0;
-    for (i, v) in visits.iter().enumerate() {
-        if v.state != "a_reprendre" && v.state != "en_attente" {
-            continue;
-        }
-        count += 1;
-        let neighbors = visit_neighbors(&visits, i);
-        let clean = |s: &str| s.replace('\"', "\"\"").replace(['\n', '\r'], " ");
-        text.push_str(&format!(
-            "\"{}\";\"{}\";\"{}\";\"{}\";\"{}\";\"{}\";\"{}\";{}\n",
-            clean(&v.observed_at),
-            clean(&v.name),
-            clean(&v.state),
-            clean(&v.reason),
-            clean(&v.evidence),
-            clean(neighbors.before.as_deref().unwrap_or("")),
-            clean(neighbors.after.as_deref().unwrap_or("")),
-            neighbors.ambiguous
-        ));
-    }
-    fs::create_dir_all(folder).map_err(|e| e.to_string())?;
-    fs::write(&path, text).map_err(|e| e.to_string())?;
-    Ok((path, count))
-}
-
-/// Après un arrêt forcé, aucune lecture d'une session précédente ne doit
-/// rester indéfiniment affichée comme « en cours ».
-pub fn recover_interrupted(folder: &Path) -> Result<usize, String> {
-    let db = connect()?;
-    let n = db
-        .execute(
-            "UPDATE visits SET state='a_reprendre',
-        reason='Capture interrompue avant confirmation' WHERE folder=?1 AND state='en_attente'",
-            params![folder_key(folder)],
-        )
-        .map_err(|e| e.to_string())?;
-    Ok(n)
-}
-
-#[cfg(test)]
-mod neighbor_tests {
-    use super::*;
-    fn v(id: i64, name: &str, state: &str, session: &str) -> VisitRecord {
-        VisitRecord {
-            id,
-            name: name.into(),
-            state: state.into(),
-            reason: String::new(),
-            observed_at: String::new(),
-            evidence: String::new(),
-            session_id: session.into(),
-        }
-    }
-    #[test]
-    fn anonymous_gap_is_framed_by_known_items_not_guessed() {
-        let visits = vec![
-            v(5, "Après", "enregistre", "A"),
-            v(4, "", "a_reprendre", "A"),
-            v(3, "", "a_reprendre", "A"),
-            v(2, "Avant", "enregistre", "A"),
-        ];
-        let c = visit_neighbors(&visits, 1);
-        assert_eq!(c.before.as_deref(), Some("Avant"));
-        assert_eq!(c.after.as_deref(), Some("Après"));
-        assert_eq!(c.ambiguous, 2);
-    }
-    #[test]
-    fn sessions_are_not_connected_even_when_ordered() {
-        let visits = vec![
-            v(5, "Après", "enregistre", "B"),
-            v(4, "", "a_reprendre", "B"),
-            v(3, "Avant", "enregistre", "A"),
-        ];
-        let c = visit_neighbors(&visits, 1);
-        assert!(c.before.is_none());
-        assert_eq!(c.after.as_deref(), Some("Après"));
-    }
-    #[test]
-    fn incomplete_names_and_legacy_without_session_are_not_used() {
-        let visits = vec![
-            v(3, "Après", "enregistre", ""),
-            v(2, "", "a_reprendre", ""),
-            v(1, "Avant", "enregistre", ""),
-        ];
-        assert_eq!(visit_neighbors(&visits, 1), Neighbors::default());
-    }
-}
-
-#[cfg(test)]
-mod deletion_tests {
-    use super::*;
-    #[test]
-    fn deletion_scopes_never_touch_items_or_other_folders() {
-        let mut db = Connection::open_in_memory().unwrap();
-        db.execute_batch(
-            "CREATE TABLE visits(id INTEGER PRIMARY KEY,folder TEXT,state TEXT);
-            CREATE TABLE items(path TEXT PRIMARY KEY);
-            INSERT INTO visits VALUES(1,'A','enregistre'),(2,'A','a_reprendre'),
-                (3,'A','en_attente'),(4,'B','a_reprendre');
-            INSERT INTO items VALUES('capture.png');",
-        )
-        .unwrap();
-        let mut removed = clear_visits_on(&mut db, "A", true).unwrap();
-        removed.sort_unstable();
-        assert_eq!(removed, vec![2, 3]);
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM visits", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            2
-        );
-        assert_eq!(
-            db.query_row("SELECT count(*) FROM items", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            1
-        );
-        // A new observation after clearing must remain independently removable.
-        db.execute("INSERT INTO visits VALUES(5,'A','en_attente')", [])
-            .unwrap();
-        let mut removed = clear_visits_on(&mut db, "A", false).unwrap();
-        removed.sort_unstable();
-        assert_eq!(removed, vec![1, 5]);
-        assert_eq!(
-            db.query_row("SELECT id FROM visits", [], |r| r.get::<_, i64>(0))
-                .unwrap(),
-            4
-        );
-    }
-}
+#[path = "history_store.rs"]
+mod history_store;
+pub use history_store::{
+    clear_visits_with_ids, delete_visit, export_missing, recent_visits, recover_interrupted,
+    store_visit, visit_neighbors, VisitRecord,
+};

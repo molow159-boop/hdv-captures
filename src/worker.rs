@@ -1,6 +1,8 @@
 use crate::duplicates;
+use crate::error::AppError;
 use crate::ocr::{self, Name};
 use crate::settings::{CaptureRect, Settings};
+use crate::state::{ProcessingPhase, VisitState};
 use crate::vision::{self, Fingerprint};
 use crate::{diagnostics, index};
 use chrono::Local;
@@ -24,6 +26,7 @@ pub enum WorkerCommand {
     Manual,
     Calibrate,
     Diagnostic,
+    Pause(Sender<()>),
     Shutdown,
 }
 
@@ -36,19 +39,33 @@ pub enum CaptureState {
 }
 
 pub enum WorkerEvent {
+    Scoped {
+        folder: PathBuf,
+        session: String,
+        event: Box<WorkerEvent>,
+    },
+    Timing {
+        waiting: Duration,
+        ocr: Duration,
+        save: Duration,
+    },
+    Progress {
+        phase: ProcessingPhase,
+        elapsed: Duration,
+    },
     Saved {
         path: PathBuf,
         note: String,
     },
     State(CaptureState, String),
-    Error(String),
+    Error(AppError),
     Calibration(RgbaImage),
     Diagnostic(PathBuf),
     Skipped,
     Visit {
         id: i64,
         name: Option<String>,
-        state: &'static str,
+        state: VisitState,
         reason: String,
         evidence: Option<PathBuf>,
     },
@@ -76,19 +93,35 @@ pub fn monitors() -> Vec<String> {
     }
 }
 
-fn grab(index: usize) -> Result<RgbaImage, String> {
-    let screens = Screen::all().map_err(|e| format!("Accès écrans : {e}"))?;
-    let screen = screens.get(index).ok_or("Écran choisi introuvable")?;
+fn grab(index: usize) -> Result<RgbaImage, AppError> {
+    thread_local! {static SCREENS:std::cell::RefCell<Option<(Instant,Vec<Screen>)>>=const{std::cell::RefCell::new(None)};}
+    let screen = SCREENS.with(|slot| -> Result<Screen, AppError> {
+        let mut cached = slot.borrow_mut();
+        if !cached
+            .as_ref()
+            .is_some_and(|(time, _)| time.elapsed() < Duration::from_secs(2))
+        {
+            *cached = Some((
+                Instant::now(),
+                Screen::all().map_err(|e| AppError::context("Accès écrans", e))?,
+            ));
+        }
+        cached
+            .as_ref()
+            .and_then(|(_, screens)| screens.get(index))
+            .copied()
+            .ok_or_else(|| AppError::Domain(crate::error::DomainError::ScreenNotFound))
+    })?;
     let img = screen
         .capture()
-        .map_err(|e| format!("Capture écran : {e}"))?;
+        .map_err(|e| AppError::context("Capture écran", e))?;
     RgbaImage::from_raw(img.width(), img.height(), img.into_raw())
-        .ok_or("Format d'image inattendu".into())
+        .ok_or(AppError::Domain(crate::error::DomainError::UnexpectedImage))
 }
 
 // Windows interdit certains caractères, noms spéciaux et un point final.
 // N'utiliser JAMAIS du texte OCR comme un chemin sans le nettoyer.
-fn safe_item_filename(name: &str) -> String {
+pub(crate) fn safe_item_filename(name: &str) -> String {
     let mut s = String::new();
     for c in name.chars() {
         if c.is_control() || "<>:\"/\\|?*".contains(c) {
@@ -135,12 +168,12 @@ fn save(
     name: &str,
     manual: bool,
     quality: &str,
-) -> Result<SaveOutcome, String> {
+) -> Result<SaveOutcome, AppError> {
     let _guard = duplicates::lock_capture_files()?;
-    std::fs::create_dir_all(destination).map_err(|e| format!("Création dossier : {e}"))?;
+    std::fs::create_dir_all(destination).map_err(|e| AppError::context("Création dossier", e))?;
     let key = duplicates::normalize_item(name);
     if key.is_empty() {
-        return Err("Nom d'objet OCR invalide".into());
+        return Err(AppError::Domain(crate::error::DomainError::InvalidOcrName));
     }
     let existing = duplicates::paths_for_item(destination, &key)?;
     if !manual && (!existing.is_empty() || index::item_prepared(destination, &key)?) {
@@ -149,7 +182,7 @@ fn save(
     let target = destination.join(format!("{}.png", safe_item_filename(name)));
     // Ne jamais écraser un fichier au nom identique qui désigne un autre objet.
     if target.exists() && duplicates::item_from_filename(&target).as_deref() != Some(key.as_str()) {
-        return Err(format!("Conflit de nom de fichier : {}", target.display()));
+        return Err(AppError::FileConflict(target.clone()));
     }
     if !manual && target.exists() {
         return Ok(SaveOutcome::AlreadyPresent);
@@ -161,13 +194,14 @@ fn save(
         Local::now().format("%Y%m%d%H%M%S%9f")
     ));
     img.save_with_format(&temp, image::ImageFormat::Png)
-        .map_err(|e| format!("Enregistrement PNG : {e}"))?;
+        .map_err(|e| AppError::context("Enregistrement PNG", e))?;
     let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
     if manual && !existing.is_empty() {
         let backup = destination.join("Captures_remplacees");
+        duplicates::ensure_plain_child(destination, &backup)?;
         if let Err(e) = std::fs::create_dir_all(&backup) {
             let _ = std::fs::remove_file(&temp);
-            return Err(format!("Dossier d'archives : {e}"));
+            return Err(AppError::context("Dossier d'archives", e));
         }
         for old in &existing {
             let Some(file_name) = old.file_name() else {
@@ -184,13 +218,14 @@ fn save(
                     let _ = std::fs::rename(arch, orig);
                 }
                 let _ = std::fs::remove_file(&temp);
-                return Err(format!("Archivage avant actualisation : {e}"));
+                return Err(AppError::context("Archivage avant actualisation", e));
             }
             moved.push((old.clone(), path));
         }
     }
     match std::fs::rename(&temp, &target) {
         Ok(()) => {
+            duplicates::saved(destination, &target, name);
             if let Err(e) = index::saved(destination, &target, name, quality) {
                 diagnostics::write("INDEX", &e);
             }
@@ -201,7 +236,7 @@ fn save(
             for (orig, arch) in moved.iter().rev() {
                 let _ = std::fs::rename(arch, orig);
             }
-            Err(format!("Finalisation de la capture : {e}"))
+            Err(AppError::context("Finalisation de la capture", e))
         }
     }
 }
@@ -213,10 +248,88 @@ fn locate_panel(frame: &RgbaImage, settings: &Settings) -> Option<CaptureRect> {
     vision::detect(frame, desired).map(|d| d.rect)
 }
 
-fn event_state(tx: &Sender<WorkerEvent>, state: CaptureState, message: impl Into<String>) {
+fn event_state(tx: &EventSender, state: CaptureState, message: impl Into<String>) {
     let _ = tx.send(WorkerEvent::State(state, message.into()));
 }
 
+#[derive(Clone)]
+struct EventSender {
+    sender: Sender<WorkerEvent>,
+    folder: PathBuf,
+    session: String,
+}
+impl EventSender {
+    fn at(&self, settings: &Settings) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            folder: settings.destination.clone(),
+            session: settings.runtime_session.clone(),
+        }
+    }
+    fn send(&self, event: WorkerEvent) -> Result<(), ()> {
+        self.sender
+            .send(WorkerEvent::Scoped {
+                folder: self.folder.clone(),
+                session: self.session.clone(),
+                event: Box::new(event),
+            })
+            .map_err(|_| ())
+    }
+}
+pub struct Runtime {
+    pub pending: Arc<std::sync::atomic::AtomicUsize>,
+    pub admitted: Arc<std::sync::atomic::AtomicBool>,
+    pub finished: Arc<std::sync::atomic::AtomicBool>,
+}
+struct JobCompletion {
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+    sender: EventSender,
+    started: Instant,
+    processing: bool,
+    waiting: Duration,
+    ocr: Duration,
+    save: Duration,
+}
+impl Drop for JobCompletion {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, Ordering::SeqCst);
+        if !self.processing {
+            return;
+        }
+        let _ = self.sender.send(WorkerEvent::Timing {
+            waiting: self.waiting,
+            ocr: self.ocr,
+            save: self.save,
+        });
+        let _ = self.sender.send(WorkerEvent::Progress {
+            phase: ProcessingPhase::Finished,
+            elapsed: self.started.elapsed(),
+        });
+    }
+}
+fn compact_job(frame: RgbaImage, rect: CaptureRect) -> (RgbaImage, CaptureRect) {
+    let left = rect.x.saturating_sub(240);
+    let top = rect.y.saturating_sub(130);
+    let right = rect
+        .x
+        .saturating_add(rect.width)
+        .saturating_add(240)
+        .min(frame.width());
+    let bottom = rect
+        .y
+        .saturating_add(rect.height)
+        .max(rect.y.saturating_add(265))
+        .min(frame.height());
+    let image = image::imageops::crop_imm(&frame, left, top, right - left, bottom - top).to_image();
+    (
+        image,
+        CaptureRect {
+            x: rect.x - left,
+            y: rect.y - top,
+            ..rect
+        },
+    )
+}
 struct Job {
     visit_id: i64,
     frame: RgbaImage,
@@ -225,6 +338,7 @@ struct Job {
     exe: Option<PathBuf>,
     manual: bool,
     generation: u64,
+    completion: JobCompletion,
 }
 
 // Le thread capture l'écran rapidement; ce thread séparé effectue l'OCR, le
@@ -232,17 +346,17 @@ struct Job {
 fn processor(
     rx: Receiver<Job>,
     manual_rx: Receiver<Job>,
-    tx: Sender<WorkerEvent>,
+    tx: EventSender,
     current_generation: Arc<AtomicU64>,
     hover_pending: Arc<AtomicBool>,
     retry_rejected: Arc<AtomicBool>,
-) {
+) -> std::thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut last_skipped_key: Option<String> = None;
         loop {
-            // Priorité à F9 et au bouton manuel. Ces demandes ne doivent pas
+            // Priorité à raccourci manuel et au bouton manuel. Ces demandes ne doivent pas
             // attendre derrière les refus/reprises du mode automatique.
-            let job = match manual_rx.try_recv() {
+            let mut job = match manual_rx.try_recv() {
                 Ok(job) => job,
                 Err(_) => match rx.recv_timeout(Duration::from_millis(75)) {
                     Ok(job) => job,
@@ -250,25 +364,35 @@ fn processor(
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 },
             };
-            if job.generation != current_generation.load(Ordering::Relaxed) {
-                visit(
-                    &tx,
-                    job.visit_id,
-                    None,
-                    "a_reprendre",
-                    "Analyse interrompue par changement de réglage",
-                );
-                continue;
-            }
+            job.completion.processing = true;
+            job.completion.waiting = job.completion.started.elapsed();
+            job.completion.started = Instant::now();
+            let tx = tx.at(&job.settings);
+            let set_retry = |value| {
+                if job.generation == current_generation.load(Ordering::Relaxed) {
+                    retry_rejected.store(value, Ordering::Relaxed);
+                }
+            };
+            let set_hover = |value| {
+                if job.generation == current_generation.load(Ordering::Relaxed) {
+                    hover_pending.store(value, Ordering::Relaxed);
+                }
+            };
+            let _ = tx.send(WorkerEvent::Progress {
+                phase: ProcessingPhase::Recognizing,
+                elapsed: Duration::ZERO,
+            });
+            let _ = &job.completion;
+
             let Some(panel) = vision::crop(&job.frame, job.rect) else {
                 visit(
                     &tx,
                     job.visit_id,
                     None,
-                    "a_reprendre",
+                    VisitState::NeedsReview,
                     "Recadrage du panneau impossible",
                 );
-                retry_rejected.store(true, Ordering::Relaxed);
+                set_retry(true);
                 continue;
             };
             if !vision::verified_detail_crop(&panel) {
@@ -276,10 +400,10 @@ fn processor(
                     &tx,
                     job.visit_id,
                     None,
-                    "a_reprendre",
+                    VisitState::NeedsReview,
                     "Structure de fiche invalide",
                 );
-                retry_rejected.store(true, Ordering::Relaxed);
+                set_retry(true);
                 event_state(
                     &tx,
                     CaptureState::Incomplete,
@@ -292,10 +416,10 @@ fn processor(
                     &tx,
                     job.visit_id,
                     None,
-                    "a_reprendre",
+                    VisitState::NeedsReview,
                     "Dernier prix non confirmé",
                 );
-                retry_rejected.store(true, Ordering::Relaxed);
+                set_retry(true);
                 if job.manual {
                     event_state(
                         &tx,
@@ -310,10 +434,10 @@ fn processor(
                     &tx,
                     job.visit_id,
                     None,
-                    "a_reprendre",
+                    VisitState::NeedsReview,
                     "Tesseract indisponible",
                 );
-                retry_rejected.store(true, Ordering::Relaxed);
+                set_retry(true);
                 // Même en manuel, aucun fichier anonyme : le nom OCR fait partie
                 // du contrat de sauvegarde. Il faut installer Tesseract fra+eng.
                 event_state(
@@ -327,7 +451,10 @@ fn processor(
                 );
                 continue;
             };
-            let title = match ocr::analyze_panel(&job.frame, job.rect, exe) {
+            let ocr_start = Instant::now();
+            let recognition = ocr::analyze_panel(&job.frame, job.rect, exe);
+            job.completion.ocr += ocr_start.elapsed();
+            let title = match recognition {
                 Ok(Some(name)) => name,
                 Ok(None) => {
                     visit_with_preview(
@@ -335,15 +462,15 @@ fn processor(
                         &job,
                         &panel,
                         None,
-                        "a_reprendre",
+                        VisitState::NeedsReview,
                         "Nom illisible par OCR",
                     );
-                    retry_rejected.store(true, Ordering::Relaxed);
+                    set_retry(true);
                     event_state(
                         &tx,
                         CaptureState::Incomplete,
                         if job.manual {
-                            "Capture F9 refusée : nom OCR illisible. Consulte « Diagnostics »."
+                            "Capture manuelle refusée : nom OCR illisible. Consulte « Diagnostics »."
                         } else {
                             "OCR : nom non reconnu. Nouvelle tentative automatique prévue."
                         },
@@ -356,10 +483,10 @@ fn processor(
                         &job,
                         &panel,
                         None,
-                        "a_reprendre",
+                        VisitState::NeedsReview,
                         format!("OCR : {e}"),
                     );
-                    retry_rejected.store(true, Ordering::Relaxed);
+                    set_retry(true);
                     event_state(
                         &tx,
                         CaptureState::Incomplete,
@@ -370,13 +497,16 @@ fn processor(
             };
             let (image, name, note) = match title {
                 Name::Complete(name) => {
-                    hover_pending.store(false, Ordering::Relaxed);
+                    set_hover(false);
                     (panel, name, "Fiche complète, prix visibles".to_owned())
                 }
                 Name::Truncated(prefix) => {
-                    match ocr::find_hover(&job.frame, job.rect, &prefix, exe) {
+                    let ocr_start = Instant::now();
+                    let hover = ocr::find_hover(&job.frame, job.rect, &prefix, exe);
+                    job.completion.ocr += ocr_start.elapsed();
+                    match hover {
                         Ok(Some(hover)) if vision::offers_still_visible(&job.frame, job.rect) => {
-                            hover_pending.store(false, Ordering::Relaxed);
+                            set_hover(false);
                             let expanded = ocr::expanded_rect(
                                 job.rect,
                                 hover.text_rect,
@@ -388,7 +518,7 @@ fn processor(
                                     &tx,
                                     job.visit_id,
                                     Some(&prefix),
-                                    "a_reprendre",
+                                    VisitState::NeedsReview,
                                     "Recadrage infobulle impossible",
                                 );
                                 continue;
@@ -405,11 +535,11 @@ fn processor(
                                 &job,
                                 &panel,
                                 Some(&prefix),
-                                "en_attente",
+                                VisitState::Pending,
                                 "Survol requis pour le nom complet",
                             );
-                            retry_rejected.store(true, Ordering::Relaxed);
-                            hover_pending.store(true, Ordering::Relaxed);
+                            set_retry(true);
+                            set_hover(true);
                             event_state(&tx,CaptureState::Waiting,"Nom tronqué : maintiens l'infobulle visible puis appuie à nouveau sur le raccourci si nécessaire.");
                             continue;
                         }
@@ -418,10 +548,10 @@ fn processor(
                                 &tx,
                                 job.visit_id,
                                 Some(&prefix),
-                                "a_reprendre",
+                                VisitState::NeedsReview,
                                 format!("Infobulle : {e}"),
                             );
-                            retry_rejected.store(true, Ordering::Relaxed);
+                            set_retry(true);
                             event_state(
                                 &tx,
                                 CaptureState::Incomplete,
@@ -432,8 +562,15 @@ fn processor(
                     }
                 }
                 Name::Unreadable => {
-                    visit_with_preview(&tx, &job, &panel, None, "a_reprendre", "Nom non reconnu");
-                    retry_rejected.store(true, Ordering::Relaxed);
+                    visit_with_preview(
+                        &tx,
+                        &job,
+                        &panel,
+                        None,
+                        VisitState::NeedsReview,
+                        "Nom non reconnu",
+                    );
+                    set_retry(true);
                     event_state(
                         &tx,
                         CaptureState::Incomplete,
@@ -442,27 +579,21 @@ fn processor(
                     continue;
                 }
             };
-            if job.generation != current_generation.load(Ordering::Relaxed) {
-                visit(
-                    &tx,
-                    job.visit_id,
-                    Some(&name),
-                    "a_reprendre",
-                    "Capture annulée après changement de réglage",
-                );
-                continue;
-            }
+
             let key = duplicates::normalize_item(&name);
-            match save(&image, &job.settings.destination, &name, job.manual, &note) {
+            let save_start = Instant::now();
+            let outcome = save(&image, &job.settings.destination, &name, job.manual, &note);
+            job.completion.save += save_start.elapsed();
+            match outcome {
                 Ok(SaveOutcome::Saved(path)) => {
                     visit(
                         &tx,
                         job.visit_id,
                         Some(&name),
-                        "enregistre",
+                        VisitState::Saved,
                         "PNG enregistré",
                     );
-                    retry_rejected.store(false, Ordering::Relaxed);
+                    set_retry(false);
                     last_skipped_key = None;
                     let _ = tx.send(WorkerEvent::Saved {
                         path,
@@ -475,10 +606,10 @@ fn processor(
                         &tx,
                         job.visit_id,
                         Some(&name),
-                        "enregistre",
+                        VisitState::Saved,
                         "Déjà enregistré dans la collection",
                     );
-                    retry_rejected.store(false, Ordering::Relaxed);
+                    set_retry(false);
                     if last_skipped_key.as_deref() != Some(key.as_str()) {
                         event_state(
                             &tx,
@@ -494,22 +625,22 @@ fn processor(
                         &tx,
                         job.visit_id,
                         Some(&name),
-                        "a_reprendre",
+                        VisitState::NeedsReview,
                         format!("Enregistrement : {e}"),
                     );
-                    retry_rejected.store(true, Ordering::Relaxed);
+                    set_retry(true);
                     let _ = tx.send(WorkerEvent::Error(e));
                 }
             }
         }
-    });
+    })
 }
 
 fn save_visual_diagnostic(
     frame: &RgbaImage,
     found: Option<CaptureRect>,
     settings: &Settings,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, AppError> {
     let (sw, sh) = frame.dimensions();
     let target = found
         .or(settings.region)
@@ -537,7 +668,7 @@ fn save_visual_diagnostic(
             height: h,
         },
     )
-    .ok_or("Recadrage diagnostic impossible")?;
+    .ok_or(AppError::Domain(crate::error::DomainError::DiagnosticCrop))?;
     if let Some(rect) = found {
         let l = rect.x.saturating_sub(x).min(img.width() - 1);
         let t = rect.y.saturating_sub(y).min(img.height() - 1);
@@ -561,14 +692,14 @@ fn save_visual_diagnostic(
         }
     }
     let folder = crate::settings::config_path().with_file_name("Diagnostics_captures");
-    std::fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&folder).map_err(AppError::from)?;
     let path = folder.join(format!(
         "Capture_diagnostic_{}_{}.png",
         Local::now().format("%Y%m%d_%H%M%S"),
         std::process::id()
     ));
     img.save_with_format(&path, image::ImageFormat::Png)
-        .map_err(|e| e.to_string())?;
+        .map_err(AppError::from)?;
     diagnostics::write(
         "DETECTION",
         if found.is_some() {
@@ -592,8 +723,9 @@ struct EvidenceJob {
     id: i64,
     folder: PathBuf,
     preview: RgbaImage,
+    sender: EventSender,
 }
-fn evidence_writer(rx: Receiver<EvidenceJob>, tx: Sender<WorkerEvent>) {
+fn evidence_writer(rx: Receiver<EvidenceJob>, _tx: EventSender) -> std::thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Ok(job) = rx.recv() {
             if std::fs::create_dir_all(&job.folder).is_err() {
@@ -605,13 +737,14 @@ fn evidence_writer(rx: Receiver<EvidenceJob>, tx: Sender<WorkerEvent>) {
                 .save_with_format(&path, image::ImageFormat::Png)
                 .is_ok()
             {
-                let _ = tx.send(WorkerEvent::Evidence { id: job.id, path });
+                let _ = job.sender.send(WorkerEvent::Evidence { id: job.id, path });
             }
         }
-    });
+    })
 }
+
 fn mark_skipped(
-    tx: &Sender<WorkerEvent>,
+    tx: &EventSender,
     evidence_tx: &SyncSender<EvidenceJob>,
     old: Candidate,
     destination: &Path,
@@ -620,28 +753,37 @@ fn mark_skipped(
     if old.queued {
         return;
     }
-    visit(tx, old.visit_id, None, "a_reprendre", reason);
+    visit(tx, old.visit_id, None, VisitState::NeedsReview, reason);
     if let Some(preview) = old.preview {
         // La sauvegarde PNG est asynchrone : ne bloque pas le balayage du jeu.
         let _ = evidence_tx.try_send(EvidenceJob {
             id: old.visit_id,
             folder: destination.join("Fiches_a_reprendre"),
             preview,
+            sender: tx.clone(),
         });
     }
 }
 
 static VISIT_SEQ: AtomicI64 = AtomicI64::new(0);
 fn next_visit_id() -> i64 {
-    Local::now()
-        .timestamp_micros()
-        .saturating_add(VISIT_SEQ.fetch_add(1, Ordering::Relaxed))
+    let now = Local::now().timestamp_micros();
+    let mut previous = VISIT_SEQ.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(previous.saturating_add(1));
+        match VISIT_SEQ.compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+        {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
+    }
 }
+
 fn visit(
-    tx: &Sender<WorkerEvent>,
+    tx: &EventSender,
     id: i64,
     name: Option<&str>,
-    state: &'static str,
+    state: VisitState,
     reason: impl Into<String>,
 ) {
     let _ = tx.send(WorkerEvent::Visit {
@@ -656,11 +798,11 @@ fn visit(
 /// validés ni à la préparation d'envoi. Un refus OCR reste ainsi identifiable après
 /// changement d'objet. Une image par tentative suffit.
 fn visit_with_preview(
-    tx: &Sender<WorkerEvent>,
+    tx: &EventSender,
     job: &Job,
     image: &RgbaImage,
     name: Option<&str>,
-    state: &'static str,
+    state: VisitState,
     reason: impl Into<String>,
 ) {
     let folder = job.settings.destination.join("Fiches_a_reprendre");
@@ -683,15 +825,32 @@ fn visit_with_preview(
     });
 }
 
-pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<WorkerEvent>) {
-    let (job_tx, job_rx): (SyncSender<Job>, Receiver<Job>) = mpsc::sync_channel(10);
+pub fn spawn(
+    mut config: Settings,
+    rx: Receiver<WorkerCommand>,
+    sender: Sender<WorkerEvent>,
+) -> Runtime {
+    let tx = EventSender {
+        sender,
+        folder: config.destination.clone(),
+        session: config.runtime_session.clone(),
+    };
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let admitted = Arc::new(AtomicBool::new(false));
+    let finished = Arc::new(AtomicBool::new(false));
+    let runtime = Runtime {
+        pending: pending.clone(),
+        admitted: admitted.clone(),
+        finished: finished.clone(),
+    };
+    let (job_tx, job_rx): (SyncSender<Job>, Receiver<Job>) = mpsc::sync_channel(4);
     let (manual_tx, manual_rx): (SyncSender<Job>, Receiver<Job>) = mpsc::sync_channel(2);
     let (evidence_tx, evidence_rx) = mpsc::sync_channel(32);
-    evidence_writer(evidence_rx, tx.clone());
+    let evidence_thread = evidence_writer(evidence_rx, tx.clone());
     let generation = Arc::new(AtomicU64::new(1));
     let hover_pending = Arc::new(AtomicBool::new(false));
     let retry_rejected = Arc::new(AtomicBool::new(false));
-    processor(
+    let processor_thread = processor(
         job_rx,
         manual_rx,
         tx.clone(),
@@ -700,6 +859,7 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
         Arc::clone(&retry_rejected),
     );
     thread::spawn(move || {
+        let mut tx = tx;
         let mut candidate: Option<Candidate> = None;
         let mut last_sent: Option<(Fingerprint, Instant)> = None;
         let mut no_panel_reported = false;
@@ -719,9 +879,11 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
             match rx.recv_timeout(wait) {
                 Ok(WorkerCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                     generation.fetch_add(1, Ordering::Relaxed);
+                    admitted.store(false, Ordering::SeqCst);
                     break;
                 }
                 Ok(WorkerCommand::Configure(s)) => {
+                    admitted.store(false, Ordering::SeqCst);
                     // Une modification de touche/mode d'affichage ne justifie
                     // pas de redémarrer Tesseract ni d'effacer tout le suivi.
                     let ocr_changed = config.ocr_exe != s.ocr_exe;
@@ -730,6 +892,7 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                     let capture_changed =
                         geometry_changed || ocr_changed || config.destination != s.destination;
                     config = s;
+                    tx = tx.at(&config);
                     // Galerie / son / mode compact ne doivent JAMAIS annuler
                     // les fiches déjà en cours d'OCR.
                     if capture_changed {
@@ -769,6 +932,7 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                         }
                     }
                     config.automatic = on;
+                    admitted.store(on, Ordering::SeqCst);
                     // OFF arrête les nouvelles détections mais laisse finir
                     // les PNG déjà placés dans la file OCR.
                     candidate = None;
@@ -813,6 +977,11 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                         let _ = tx.send(WorkerEvent::Error(e));
                     }
                 },
+                Ok(WorkerCommand::Pause(ack)) => {
+                    config.automatic = false;
+                    admitted.store(false, Ordering::SeqCst);
+                    let _ = ack.send(());
+                }
                 Ok(WorkerCommand::Manual) => {
                     let visit_id = next_visit_id();
                     match grab(config.screen_index) {
@@ -822,10 +991,22 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                                     &tx,
                                     visit_id,
                                     None,
-                                    "en_attente",
-                                    "Capture manuelle F9 à analyser",
+                                    VisitState::Pending,
+                                    "Capture manuelle à analyser",
                                 );
+                                let (frame, rect) = compact_job(frame, rect);
+                                pending.fetch_add(1, Ordering::SeqCst);
+                                let completion = JobCompletion {
+                                    pending: pending.clone(),
+                                    sender: tx.at(&config),
+                                    started: Instant::now(),
+                                    processing: false,
+                                    waiting: Duration::ZERO,
+                                    ocr: Duration::ZERO,
+                                    save: Duration::ZERO,
+                                };
                                 let job = Job {
+                                    completion,
                                     visit_id,
                                     frame,
                                     rect,
@@ -839,13 +1020,13 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                                         &tx,
                                         visit_id,
                                         None,
-                                        "a_reprendre",
+                                        VisitState::NeedsReview,
                                         "File manuelle pleine",
                                     );
                                     event_state(
                                         &tx,
                                         CaptureState::Incomplete,
-                                        "Trop de captures manuelles en attente : réessaie F9.",
+                                        "Trop de captures manuelles en attente : réessaie le raccourci manuel.",
                                     );
                                 }
                             } else {
@@ -946,7 +1127,7 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                                 &tx,
                                 id,
                                 None,
-                                "en_attente",
+                                VisitState::Pending,
                                 "Fiche ouverte, en cours de reconnaissance",
                             );
                             // Conserver le panneau dès sa première apparition, avant
@@ -978,7 +1159,19 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                         .as_ref()
                         .map(|c| c.visit_id)
                         .unwrap_or_else(next_visit_id);
+                    let (frame, rect) = compact_job(frame, rect);
+                    pending.fetch_add(1, Ordering::SeqCst);
+                    let completion = JobCompletion {
+                        pending: pending.clone(),
+                        sender: tx.at(&config),
+                        started: Instant::now(),
+                        processing: false,
+                        waiting: Duration::ZERO,
+                        ocr: Duration::ZERO,
+                        save: Duration::ZERO,
+                    };
                     let job = Job {
+                        completion,
                         visit_id,
                         frame,
                         rect,
@@ -1007,7 +1200,9 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                             }
                         }
                         Err(TrySendError::Disconnected(_)) => {
-                            let _ = tx.send(WorkerEvent::Error("Thread OCR arrêté".into()));
+                            let _ = tx.send(WorkerEvent::Error(AppError::Domain(
+                                crate::error::DomainError::OcrStopped,
+                            )));
                             break;
                         }
                     }
@@ -1015,12 +1210,109 @@ pub fn spawn(mut config: Settings, rx: Receiver<WorkerCommand>, tx: Sender<Worke
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         }
+        drop(job_tx);
+        drop(manual_tx);
+        drop(evidence_tx);
+        let _ = processor_thread.join();
+        let _ = evidence_thread.join();
+        finished.store(true, Ordering::SeqCst);
     });
+    runtime
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn compact_jobs_keep_the_panel_and_tooltip_context_without_the_full_screen() {
+        let frame = RgbaImage::from_pixel(3840, 2160, image::Rgba([12, 23, 34, 255]));
+        let rect = CaptureRect {
+            x: 1500,
+            y: 300,
+            width: 413,
+            height: 700,
+        };
+        let (compact, local) = compact_job(frame, rect);
+        assert!(compact.width() < 1000);
+        assert!(compact.height() < 1000);
+        assert_eq!(local.width, rect.width);
+        assert_eq!(local.height, rect.height);
+        assert_eq!(
+            vision::crop(&compact, local).unwrap().dimensions(),
+            (413, 700)
+        );
+    }
+    #[test]
+    fn manual_queue_has_priority_and_completion_is_counted_even_on_rejection() {
+        let (tx, events) = mpsc::channel();
+        let folder = std::env::temp_dir().join("hdv-queue-test");
+        let sender = EventSender {
+            sender: tx,
+            folder: folder.clone(),
+            session: "test".into(),
+        };
+        let (auto_tx, auto_rx) = mpsc::sync_channel(2);
+        let (manual_tx, manual_rx) = mpsc::sync_channel(2);
+        let pending = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+        let job = |visit_id| Job {
+            visit_id,
+            frame: RgbaImage::new(1, 1),
+            rect: CaptureRect::default(),
+            settings: Settings {
+                destination: folder.clone(),
+                ..Default::default()
+            },
+            exe: None,
+            manual: false,
+            generation: 1,
+            completion: JobCompletion {
+                pending: pending.clone(),
+                sender: sender.clone(),
+                started: Instant::now(),
+                processing: false,
+                waiting: Duration::ZERO,
+                ocr: Duration::ZERO,
+                save: Duration::ZERO,
+            },
+        };
+        auto_tx.send(job(22)).unwrap();
+        manual_tx.send(job(11)).unwrap();
+        drop(auto_tx);
+        drop(manual_tx);
+        let worker = processor(
+            auto_rx,
+            manual_rx,
+            sender,
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        worker.join().unwrap();
+        assert_eq!(pending.load(Ordering::SeqCst), 0);
+        let ids = events
+            .try_iter()
+            .filter_map(|event| {
+                if let WorkerEvent::Scoped { event, .. } = event {
+                    if let WorkerEvent::Visit { id, .. } = *event {
+                        return Some(id);
+                    }
+                }
+                None
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec![11, 22]);
+    }
+    #[test]
+    fn visit_ids_remain_unique_when_called_concurrently() {
+        let handles = (0..8)
+            .map(|_| std::thread::spawn(|| (0..1000).map(|_| next_visit_id()).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let ids = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 8000);
+    }
     #[test]
     fn filename_rejects_windows_special_chars() {
         assert_eq!(safe_item_filename("Cape / Glace: 3?"), "Cape _ Glace_ 3_");

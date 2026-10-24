@@ -1,0 +1,19 @@
+name: Avis de sécurité Rust
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 8 * * 1'
+permissions:
+  contents: read
+jobs:
+  audit:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer les outils de vérification
+        run: |
+          rustup toolchain install 1.99.1 --profile minimal
+          cargo install cargo-audit --locked --version 0.22.2
+      - name: Vérifier la cible Windows
+        shell: pwsh
+        run: ./Verifier-Securite.ps1
