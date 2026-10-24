@@ -17,7 +17,7 @@ jobs:
           ./Compiler-Windows.ps1
           ./Compiler-OCR.ps1
           Copy-Item README.md, LICENSE, LICENCES-TIERS.txt, SECURITY.md target/release/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: HDV-Captures-Windows-x64
           path: |
