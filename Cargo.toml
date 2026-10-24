@@ -6,7 +6,7 @@ license = "MIT"
 description = "Capture locale des fiches HDV de Dofus 3 pour import manuel"
 
 [dependencies]
-eframe = "0.31"
+eframe = "0.37"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 screenshots = "0.8.10"
 global-hotkey = "0.7"
