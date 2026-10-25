@@ -21,8 +21,6 @@
 
 Ferme complètement l’ancienne application, puis extrais le nouveau ZIP Windows dans un nouveau dossier. Lance **HDV Captures.exe** en gardant le dossier **ocr** à côté. Les réglages, profils et l’historique restent dans **%APPDATA%\HDV Captures** ; le dossier de captures configuré est conservé. Les données de l’édition alternative **HDV Captures Test** restent séparées.
 
-Cette version reprend les outils de gestion de la version alternative et réorganise le code des états, erreurs, écrans et opérations en arrière-plan. Elle conserve le format de l’historique existant. Les dépendances signalées non maintenues n’ont pas été remplacées.
-
 ## L’essentiel
 
 | Fonction | Utilisation |
@@ -137,7 +135,7 @@ Le moteur intégré utilise ses propres langues. Une mise à jour de Tesseract i
 
 Les captures vont par défaut dans `%USERPROFILE%\Pictures\HDV Captures`. Les préférences, le suivi SQLite et les journaux restent dans `%APPDATA%\HDV Captures`.
 
-L'application lit les pixels de l'écran et utilise un OCR local. Elle n'envoie pas de clics ni de touches au jeu et n'importe pas automatiquement les captures. Masquer sa fenêtre n'arrête pas la collecte ; arrête-la avant d'afficher du contenu privé dans la zone surveillée.
+L'application lit les pixels de l'écran et utilise un OCR local. Elle n'envoie pas de clics ni de touches au jeu et n'importe pas automatiquement les captures.
 
 Ce dépôt contient les sources, les ressources nécessaires, les scripts, les licences, la documentation illustrée et les vérifications Windows. Il ne contient ni historique, ni captures de jeu personnelles, ni configuration utilisateur. Les tests publics utilisent des données synthétiques. Voir [SECURITY.md](SECURITY.md) pour les signalements et la protection des données.
 
